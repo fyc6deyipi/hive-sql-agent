@@ -1,0 +1,2315 @@
+[
+  {
+    "model": "glm-5.1",
+    "case_id": 1,
+    "case_label": "CASE-1 big-small JOIN + select *",
+    "score": {
+      "hit_categories": [
+        "join_strategy",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 2
+    },
+    "result_json": {
+      "summary": "大表 dwd_order(500GB) 与小维表 dim_user(50MB) JOIN 未使用 MapJoin，且 SELECT * 缺乏列裁剪，是当前 SQL 最关键的两个写法问题",
+      "severity": "high",
+      "estimated_speedup": "3x~5x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "使用 SELECT * 缺少列裁剪",
+          "evidence": "SQL 中 `select a.*`，dwd_order 含 order_id/user_id/amount 等字段以及分区 dt，全部输出无法利用 ORC 列存的列裁剪能力",
+          "root_cause": "dwd_order 是 ORC 列存大表（500GB），SELECT a.* 会读取并输出所有列，无法利用列裁剪，I/O 与 shuffle 数据量都被放大；同时下游若仅使用部分列，也会浪费",
+          "recommendation": "建议显式列出实际需要的字段，仅保留下游真正使用的列，从而触发 ORC 的列裁剪，减少扫描与 shuffle 数据量",
+          "expected_gain": "1.5x~3x（取决于实际所需列占比）"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "join_strategy",
+          "severity": "high",
+          "title": "大小表 JOIN 未使用 MapJoin Hint",
+          "evidence": "SQL 中 `left join dim_user b on a.user_id=b.uid`，根据 stats，dim_user 仅 50MB（< 100MB），属于典型小维表，但 SQL 中未添加 /*+ MAPJOIN(b) */ 提示",
+          "root_cause": "dwd_order(500GB) 与 dim_user(50MB) 走默认 Common Join 时，dwd_order 必须按 user_id 进行 shuffle，5 亿行级别的 shuffle 开销巨大；而 dim_user 完全可以广播到 map 端，避免 shuffle",
+          "recommendation": "建议为小维表 dim_user 添加 MapJoin 提示（在 SQL 写法上显式提示小表），让其加载到 map 端内存中完成 JOIN，从而完全消除大表 shuffle",
+          "expected_gain": "3x~5x"
+        }
+      ],
+      "needs_human_check": [
+        "请人工核查 dwd_order.user_id 与 dim_user.uid 的关联键分布：是否存在大量 NULL 或空字符串等可能导致 JOIN 长尾的潜在风险（无法从 SQL/DDL/stats 直接判断）",
+        "请人工核查 dwd_order 在 dt='20250101' 单分区下的数据量级，确认单分区是否过大需要进一步缩小过滤范围",
+        "请人工核查下游真正使用的字段集合，以确定 SELECT * 应替换为哪些具体列"
+      ],
+      "markdown_report": "## 总结\n\n本次 SQL 在写法层面存在两处明显问题：(1) 大小表 JOIN 未使用 MapJoin，导致 500GB 的 dwd_order 走 shuffle；(2) SELECT * 无法利用 ORC 列裁剪。整体严重度为 high，预计仅通过 SQL 写法优化可获得约 3x~5x 的提速。\n\n## 问题列表\n\n### ISSUE-001 使用 SELECT * 缺少列裁剪（medium，sql_anti_pattern）\n- **证据**：SQL 中 `select a.*`，dwd_order 为 ORC 存储的大表（500GB / 50 亿行）。\n- **根因**：SELECT a.* 会读取并输出 dwd_order 全部列，无法利用 ORC 列存的列裁剪能力，造成扫描与 shuffle 数据量被放大。\n- **建议**：显式列出下游真正使用的字段，触发 ORC 列裁剪，减少 I/O 与 shuffle 体积。\n- **预估收益**：1.5x~3x（取决于实际所需列占比）。\n\n### ISSUE-002 大小表 JOIN 未使用 MapJoin Hint（high，join_strategy）\n- **证据**：SQL 中 `left join dim_user b on a.user_id=b.uid`；dim_user 容量仅 50MB，属于典型小维表；SQL 未出现 /*+ MAPJOIN(b) */。\n- **根因**：默认 Common Join 会让 dwd_order(5 亿行) 按 user_id 走 shuffle，开销巨大；而 dim_user 完全可广播到 map 端。\n- **建议**：在 SQL 中对 dim_user 添加 MapJoin 提示，使其加载到 map 端内存完成 JOIN，避免大表 shuffle。\n- **预估收益**：3x~5x。\n\n## 需人工核查项\n- dwd_order.user_id 与 dim_user.uid 的关联键分布是否存在大量 NULL/空字符串（潜在 JOIN 长尾风险，无法从 SQL/DDL/stats 直接判断）。\n- dwd_order 在 dt='20250101' 单分区下的实际数据量级，评估是否需要进一步缩小过滤范围。\n- 下游真正使用的字段集合，用于将 SELECT * 替换为具体列。\n\n## 预估收益\n仅通过 SQL 写法层面的两项改造（MapJoin + 列裁剪），整体预计可获得 **3x~5x** 提速；若叠加人工核查项中的潜在倾斜处理，提速空间可能更大。"
+    },
+    "result_markdown": "## 总结\n\n本次 SQL 在写法层面存在两处明显问题：(1) 大小表 JOIN 未使用 MapJoin，导致 500GB 的 dwd_order 走 shuffle；(2) SELECT * 无法利用 ORC 列裁剪。整体严重度为 high，预计仅通过 SQL 写法优化可获得约 3x~5x 的提速。\n\n## 问题列表\n\n### ISSUE-001 使用 SELECT * 缺少列裁剪（medium，sql_anti_pattern）\n- **证据**：SQL 中 `select a.*`，dwd_order 为 ORC 存储的大表（500GB / 50 亿行）。\n- **根因**：SELECT a.* 会读取并输出 dwd_order 全部列，无法利用 ORC 列存的列裁剪能力，造成扫描与 shuffle 数据量被放大。\n- **建议**：显式列出下游真正使用的字段，触发 ORC 列裁剪，减少 I/O 与 shuffle 体积。\n- **预估收益**：1.5x~3x（取决于实际所需列占比）。\n\n### ISSUE-002 大小表 JOIN 未使用 MapJoin Hint（high，join_strategy）\n- **证据**：SQL 中 `left join dim_user b on a.user_id=b.uid`；dim_user 容量仅 50MB，属于典型小维表；SQL 未出现 /*+ MAPJOIN(b) */。\n- **根因**：默认 Common Join 会让 dwd_order(5 亿行) 按 user_id 走 shuffle，开销巨大；而 dim_user 完全可广播到 map 端。\n- **建议**：在 SQL 中对 dim_user 添加 MapJoin 提示，使其加载到 map 端内存完成 JOIN，避免大表 shuffle。\n- **预估收益**：3x~5x。\n\n## 需人工核查项\n- dwd_order.user_id 与 dim_user.uid 的关联键分布是否存在大量 NULL/空字符串（潜在 JOIN 长尾风险，无法从 SQL/DDL/stats 直接判断）。\n- dwd_order 在 dt='20250101' 单分区下的实际数据量级，评估是否需要进一步缩小过滤范围。\n- 下游真正使用的字段集合，用于将 SELECT * 替换为具体列。\n\n## 预估收益\n仅通过 SQL 写法层面的两项改造（MapJoin + 列裁剪），整体预计可获得 **3x~5x** 提速；若叠加人工核查项中的潜在倾斜处理，提速空间可能更大。",
+    "stages": {
+      "node2_retrieval_query": "select 星号 ; select star column pruning ; 小表 JOIN MapJoin ; MapJoin broadcast small table",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-020] 大小表 JOIN 未走 MapJoin",
+        "## 知识卡索引",
+        "## [KB-034] 嵌套子查询 / 老式逗号 JOIN",
+        "## [CASE-002] 多表 LEFT JOIN 中间结果膨胀",
+        "### 建议方向",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 29.5,
+      "node4_usage": {
+        "completion_tokens": 1919,
+        "prompt_tokens": 6034,
+        "total_tokens": 7953,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"大表 dwd_order(500GB) 与小维表 dim_user(50MB) JOIN 未使用 MapJoin，且 SELECT * 缺乏列裁剪，是当前 SQL 最关键的两个写法问题\",\"severity\":\"high\",\"estimated_speedup\":\"3x~5x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"medium\",\"title\":\"使用 SELECT * 缺少列裁剪\",\"evidence\":\"SQL 中 `select a.*`，dwd_order 含"
+    }
+  },
+  {
+    "model": "glm-5.1",
+    "case_id": 2,
+    "case_label": "CASE-2 missing partition filter",
+    "score": {
+      "hit_categories": [
+        "partition_pruning"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "dwd_order 是按 dt 分区的 500GB 大表，SQL 仅用非分区字段 create_time 过滤，导致全表扫描，是本次慢任务的核心原因。",
+      "severity": "critical",
+      "estimated_speedup": "10x~50x（取决于实际命中分区数）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "critical",
+          "title": "分区裁剪缺失，导致 500GB 大表全表扫描",
+          "evidence": "dwd_order 的 DDL 含 `PARTITIONED BY (dt string)`，但 SQL 的 WHERE 仅写了 `where create_time >= '2024-01-01'`，没有对分区字段 dt 进行过滤。表容量 500GB，行数 50 亿。",
+          "root_cause": "create_time 是普通字段而非分区字段。Hive 在执行时无法基于该过滤条件进行分区裁剪，必须扫描所有 dt 分区下的全部数据，I/O 量等同于全表 500GB 全扫，是任务运行 4 小时以上的主因。",
+          "recommendation": "在 WHERE 中显式增加分区字段 dt 的过滤条件，使其匹配业务需要的时间范围，例如限定 dt 在某个起始日期之后。注意：分区字段不要被函数包裹（如 substr/from_unixtime 等），否则同样会失效。若 create_time 与 dt 不完全等价，可两个条件同时保留：先用 dt 完成分区裁剪，再用 create_time 做精确过滤。",
+          "expected_gain": "10x~50x（取决于实际需要扫描的分区数占全部分区的比例）"
+        }
+      ],
+      "needs_human_check": [
+        "请人工确认业务上 create_time 与分区字段 dt 的对应关系，以便给出正确的 dt 过滤范围（是单日、近 N 日还是某个起始日期之后）。",
+        "请人工核查 dwd_order 当前的分区总数与单分区平均大小，以更精确评估分区裁剪后的收益。"
+      ],
+      "markdown_report": "## 总结\n\n本次慢 SQL 的核心问题是：dwd_order 是一张按 dt 分区、容量 500GB、行数 50 亿的大表，但 SQL 仅用非分区字段 create_time 做过滤，未命中任何分区裁剪，导致全表扫描。这是任务长时间运行的最主要原因。\n\n## 问题列表\n\n### ISSUE-001 分区裁剪缺失，导致 500GB 大表全表扫描（critical, partition_pruning）\n\n- **证据**：dwd_order 的 DDL 含 `PARTITIONED BY (dt string)`，而 SQL 的 WHERE 仅为 `where create_time >= '2024-01-01'`，未引用分区字段 dt。表容量 500GB，行数约 50 亿。\n- **根因**：create_time 不是分区字段，Hive 无法据此进行分区裁剪，必须扫描所有 dt 分区下的数据，I/O 等同于全表 500GB 全扫。\n- **建议**：在 WHERE 中显式增加 dt 的过滤条件，限定到业务需要的时间范围；并保证分区字段不被函数包裹以免裁剪失效。若 create_time 与 dt 不完全等价，可两条件并存：dt 用于裁剪、create_time 用于精确过滤。\n- **预估收益**：10x~50x，取决于实际命中分区数。\n\n## 需人工核查项\n\n- 业务上 create_time 与分区字段 dt 的对应关系，确认应使用的 dt 过滤范围。\n- dwd_order 当前的分区总数与单分区数据量，以更准确估计裁剪后扫描量。\n\n## 预估收益\n\n仅修复分区裁剪问题，预计可获得 10x~50x 的整体加速。其余 11 项 Checklist 未发现命中证据。"
+    },
+    "result_markdown": "## 总结\n\n本次慢 SQL 的核心问题是：dwd_order 是一张按 dt 分区、容量 500GB、行数 50 亿的大表，但 SQL 仅用非分区字段 create_time 做过滤，未命中任何分区裁剪，导致全表扫描。这是任务长时间运行的最主要原因。\n\n## 问题列表\n\n### ISSUE-001 分区裁剪缺失，导致 500GB 大表全表扫描（critical, partition_pruning）\n\n- **证据**：dwd_order 的 DDL 含 `PARTITIONED BY (dt string)`，而 SQL 的 WHERE 仅为 `where create_time >= '2024-01-01'`，未引用分区字段 dt。表容量 500GB，行数约 50 亿。\n- **根因**：create_time 不是分区字段，Hive 无法据此进行分区裁剪，必须扫描所有 dt 分区下的数据，I/O 等同于全表 500GB 全扫。\n- **建议**：在 WHERE 中显式增加 dt 的过滤条件，限定到业务需要的时间范围；并保证分区字段不被函数包裹以免裁剪失效。若 create_time 与 dt 不完全等价，可两条件并存：dt 用于裁剪、create_time 用于精确过滤。\n- **预估收益**：10x~50x，取决于实际命中分区数。\n\n## 需人工核查项\n\n- 业务上 create_time 与分区字段 dt 的对应关系，确认应使用的 dt 过滤范围。\n- dwd_order 当前的分区总数与单分区数据量，以更准确估计裁剪后扫描量。\n\n## 预估收益\n\n仅修复分区裁剪问题，预计可获得 10x~50x 的整体加速。其余 11 项 Checklist 未发现命中证据。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-011] 分区裁剪缺失",
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-004] 动态分区写入长尾",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [KB-010] 列裁剪缺失（SELECT *）",
+        "## 知识卡索引"
+      ],
+      "node4_elapsed_s": 23.0,
+      "node4_usage": {
+        "completion_tokens": 1369,
+        "prompt_tokens": 5517,
+        "total_tokens": 6886,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"dwd_order 是按 dt 分区的 500GB 大表，SQL 仅用非分区字段 create_time 过滤，导致全表扫描，是本次慢任务的核心原因。\",\"severity\":\"critical\",\"estimated_speedup\":\"10x~50x（取决于实际命中分区数）\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"partition_pruning\",\"severity\":\"critical\",\"title\":\"分区裁剪缺失，导致 500GB 大表全表扫描\",\"evidence\":\"dwd_order 的 DDL 含 `PA"
+    }
+  },
+  {
+    "model": "glm-5.1",
+    "case_id": 3,
+    "case_label": "CASE-3 multi count(distinct)",
+    "score": {
+      "hit_categories": [
+        "aggregation"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "同一 SELECT 中存在 2 个 count(distinct) 且作用于 100GB 大表，存在单 Reducer 瓶颈风险",
+      "severity": "high",
+      "estimated_speedup": "2x~4x（保守估计，仅 SQL 改动）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "aggregation",
+          "severity": "high",
+          "title": "多个 count(distinct) 同时作用在大表上，存在单 Reducer 瓶颈",
+          "evidence": "SQL 中同时出现 `count(distinct user_id) as uv` 与 `count(distinct order_id) as order_cnt` 共 2 个 count(distinct)，作用于 dwd_order（容量 100GB，1 亿行，分区 dt='20250101'）",
+          "root_cause": "Hive 中多个 count(distinct) 在同一个 SELECT 中通常会退化为单 Reducer 处理，无法并行；当数据量达到亿级 / 百 GB 时，单 Reducer 会成为长尾瓶颈，运行时间随数据量线性甚至超线性增长。即使只有单个 count(distinct)，作用在 > 10GB 大表上同样存在该问题，多个 distinct 会进一步加剧。",
+          "recommendation": "原则上将每个 count(distinct) 拆为独立的子查询：先按去重 key 做 group by 得到唯一值集合，再对该集合做 count(*)，从而把去重压力从单 Reducer 分散到多个 Reducer；多个指标可分别计算后再 cross join / union 汇总。也可考虑使用 size(collect_set(...)) 的近似/分桶思路，但仍需先在子查询里做 group by 分散压力。注意：是否真正出现长尾还取决于 user_id / order_id 的分布，建议在改写前抽样核查 key 分布。",
+          "expected_gain": "2x~4x（取决于 key 分布与集群并行度）"
+        }
+      ],
+      "needs_human_check": [
+        "请抽样核查 dwd_order 在 dt='20250101' 分区下 user_id、order_id 字段是否存在大量 NULL 或空字符串，若存在会进一步加剧 distinct 单点压力",
+        "请确认 dt='20250101' 单分区的真实数据量与 key 基数（distinct 后行数），用于评估拆分子查询后的并行度收益",
+        "建议查看执行计划，确认 count(distinct) 是否被合并到一个 Reducer 阶段执行"
+      ],
+      "markdown_report": "## 总结\n\n本 SQL 在 100GB / 1 亿行的 dwd_order 大表上对单分区执行了 2 个 count(distinct) 聚合。分区裁剪已正确使用（dt='20250101'），存储格式为 ORC，整体写法较为规范，唯一的核心问题是多个 count(distinct) 在大数据量场景下容易触发单 Reducer 长尾瓶颈。\n\n## 问题列表\n\n### ISSUE-001 多个 count(distinct) 同时作用在大表上，存在单 Reducer 瓶颈\n\n- **类别**: aggregation\n- **严重度**: high\n- **证据**: SQL 中同时出现 `count(distinct user_id) as uv` 与 `count(distinct order_id) as order_cnt` 共 2 个 count(distinct)，作用于 dwd_order（容量 100GB，1 亿行，分区 dt='20250101'）。\n- **根因**: Hive 中多个 count(distinct) 在同一个 SELECT 中通常会退化为单 Reducer 处理，无法并行；亿级 / 百 GB 数据下单 Reducer 会成为明显长尾。即使只有 1 个 count(distinct)，在 >10GB 大表上同样存在该风险，2 个则进一步加剧。\n- **建议**: 将每个 count(distinct) 拆成独立子查询——先按去重 key 做 group by 得到唯一值集合，再对该集合做 count(*)，把去重压力从单 Reducer 分散到多 Reducer；多个指标可分别计算后再合并。注意：实际收益取决于 key 分布，建议先核查后再改写。\n- **预估收益**: 2x~4x\n\n## 需人工核查项\n\n1. 抽样核查 user_id、order_id 是否存在大量 NULL 或空串（潜在风险，可能加剧 distinct 单点压力）。\n2. 确认 dt='20250101' 单分区的真实数据量与去重后基数，用于评估拆分子查询后的并行度收益。\n3. 查看执行计划，确认 count(distinct) 是否被合并到一个 Reducer 阶段执行。\n\n## 预估收益\n\n仅基于 SQL 写法层面的改动，保守估计可获得 2x~4x 加速，具体取决于实际 key 分布与集群并行度。"
+    },
+    "result_markdown": "## 总结\n\n本 SQL 在 100GB / 1 亿行的 dwd_order 大表上对单分区执行了 2 个 count(distinct) 聚合。分区裁剪已正确使用（dt='20250101'），存储格式为 ORC，整体写法较为规范，唯一的核心问题是多个 count(distinct) 在大数据量场景下容易触发单 Reducer 长尾瓶颈。\n\n## 问题列表\n\n### ISSUE-001 多个 count(distinct) 同时作用在大表上，存在单 Reducer 瓶颈\n\n- **类别**: aggregation\n- **严重度**: high\n- **证据**: SQL 中同时出现 `count(distinct user_id) as uv` 与 `count(distinct order_id) as order_cnt` 共 2 个 count(distinct)，作用于 dwd_order（容量 100GB，1 亿行，分区 dt='20250101'）。\n- **根因**: Hive 中多个 count(distinct) 在同一个 SELECT 中通常会退化为单 Reducer 处理，无法并行；亿级 / 百 GB 数据下单 Reducer 会成为明显长尾。即使只有 1 个 count(distinct)，在 >10GB 大表上同样存在该风险，2 个则进一步加剧。\n- **建议**: 将每个 count(distinct) 拆成独立子查询——先按去重 key 做 group by 得到唯一值集合，再对该集合做 count(*)，把去重压力从单 Reducer 分散到多 Reducer；多个指标可分别计算后再合并。注意：实际收益取决于 key 分布，建议先核查后再改写。\n- **预估收益**: 2x~4x\n\n## 需人工核查项\n\n1. 抽样核查 user_id、order_id 是否存在大量 NULL 或空串（潜在风险，可能加剧 distinct 单点压力）。\n2. 确认 dt='20250101' 单分区的真实数据量与去重后基数，用于评估拆分子查询后的并行度收益。\n3. 查看执行计划，确认 count(distinct) 是否被合并到一个 Reducer 阶段执行。\n\n## 预估收益\n\n仅基于 SQL 写法层面的改动，保守估计可获得 2x~4x 加速，具体取决于实际 key 分布与集群并行度。",
+    "stages": {
+      "node2_retrieval_query": "count distinct 多字段 ; count distinct skew",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-031] COUNT(DISTINCT) 单 Reducer",
+        "## 知识卡索引",
+        "### 问题诊断",
+        "## 真实案例索引",
+        "## [KB-002] DISTINCT 单点瓶颈"
+      ],
+      "node4_elapsed_s": 26.3,
+      "node4_usage": {
+        "completion_tokens": 1736,
+        "prompt_tokens": 6008,
+        "total_tokens": 7744,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"同一 SELECT 中存在 2 个 count(distinct) 且作用于 100GB 大表，存在单 Reducer 瓶颈风险\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"2x~4x（保守估计，仅 SQL 改动）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"aggregation\",\n      \"severity\": \"high\",\n      \"title\": \"多个 count(distinct) 同时作用在大表上，"
+    }
+  },
+  {
+    "model": "glm-5.1",
+    "case_id": 4,
+    "case_label": "CASE-4 ORDER BY no LIMIT + select *",
+    "score": {
+      "hit_categories": [],
+      "missing": [
+        "sql_anti_pattern",
+        "partition_pruning"
+      ],
+      "extra": [],
+      "score": 0.0,
+      "issue_count": 0
+    },
+    "result_json": {
+      "error": "JSON parse failed and not markdown",
+      "raw": "{\"summary\":\"500GB 大表 dwd_order 未做分区裁剪、使用 SELECT * 且 ORDER BY 全局排序无 LIMIT，导致全表扫描后单 Reducer 排序，资源极度浪费。\",\"severity\":\"critical\",\"estimated_speedup\":\"10x~50x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"partition_pruning\",\"severity\":\"critical\",\"title\":\"分区表未使用分区字段过滤，全表扫描所有历史分区\",\"evidence\":\"DDL 中 `PARTITIONED BY (dt string)`，但 SQL `select * from dwd_order order by create_time desc` 的 WHERE 子句缺失，未对 dt 做任何过滤。表容量 500GB，行数 50 亿。\",\"root_cause\":\"分区表缺少分区谓词时，Hive 会扫描全部历史分区，I/O 与解码成本随历史增长线性放大，对 500GB 量级表是最主要的耗时来源。\",\"recommendation\":\"在 WHERE 中显式加上 dt 分区过滤（如限定单日或近 N 日），让查询只扫描必要分区；切忌在 dt 上包裹函数（会导致分区裁剪失效）。\",\"expected_gain\":\"取决于历史分区数量，常见 10x~100x\"},{\"id\":\"ISSUE-002\",\"category\":\"sql_anti_pattern\",\"severity\":\"high\",\"title\":\"SELECT * 列裁剪缺失，ORC 列存优势失效\",\"evidence\":\"SQL 第 1 行 `select * from dwd_order`，且 DDL `STORED AS ORC`。\",\"root_cause\":\"ORC 是列式存储，SELECT * 会读取所有列，无法享受列裁剪带来的 I/O 节省；同时增加后续 shuffle/排序的数据体积。\",\"recommendation\":\"按下游真实需要显式列出字段，仅查询业务必需列，最大化利用 ORC 列裁剪。\",\"expected_gain\":\"2x~5x（取决于实际使用列占总列数比例）\"},{\"id\":\"ISSUE-003\",\"category\":\"sql_anti_pattern\",\"severity\":\"critical\",\"title\":\"全局 ORDER BY 无 LIMIT，单 Reducer 排序成为瓶颈\",\"evidence\":\"SQL 末尾 `order by create_time desc;`，没有 LIMIT 子句。\",\"root_cause\":\"Hive 的 ORDER BY 是全局排序，会强制收敛到 1 个 Reducer。在 500GB / 50 亿行规模下，单 Reducer 排序几乎必然成为长尾，且很容易 OOM 或超时。\",\"recommendation\":\"如果只取 TopN，加上 LIMIT，Hive 会触发 TopN 优化避免单 Reducer 全量排序；如果是导出场景且不需要严格全局有序，考虑 SORT BY（每 Reducer 内有序）或 DISTRIBUTE BY + SORT BY；如确需全局排序，至少配合分区裁剪先把数据量压下来。\",\"expected_gain\":\"5x~20x（配合 LIMIT 时收益最大）\"}],\"needs_human_check\":[\"确认该 SQL 真实业务诉求是否需要\"全局有序\"的全量结果，还是只需 TopN，从而决定保留 ORDER BY+LIMIT 还是改为 SORT BY。\",\"确认下游真正使用了 dwd_order 的哪些列，以替换 SELECT *。\",\"确认合理的 dt 时间窗口（例如近 1 日/近 7 日），用于补齐分区过滤条件。\"],\"markdown_report\":\"## 总结\\n该 SQL 在 500GB / 50 亿行级别的 ORC 分区表上，同时踩中三大反模式：分区裁剪缺失、SELECT *、ORDER BY 无 LIMIT，是典型的\"扫全表 + 单 Reducer 排序\"长任务模式，仅靠 SQL 写法修正即可获得数量级提升。\\n\\n## 问题列表\\n\\n### ISSUE-001 分区表未使用分区字段过滤（critical, partition_pruning）\\n- **证据**：DDL `PARTITIONED BY (dt string)`，SQL 没有任何 WHERE 条件，未过滤 dt。表容量 500GB / 50 亿行。\\n- **根因**：Hive 会扫描所"
+    },
+    "result_markdown": "## JSON 解析失败\n\n```\n{\"summary\":\"500GB 大表 dwd_order 未做分区裁剪、使用 SELECT * 且 ORDER BY 全局排序无 LIMIT，导致全表扫描后单 Reducer 排序，资源极度浪费。\",\"severity\":\"critical\",\"estimated_speedup\":\"10x~50x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"partition_pruning\",\"severity\":\"critical\",\"title\":\"分区表未使用分区字段过滤，全表扫描所有历史分区\",\"evidence\":\"DDL 中 `PARTITIONED BY (dt string)`，但 SQL `select * from dwd_order order by create_time desc` 的 WHERE 子句缺失，未对 dt 做任何过滤。表容量 500GB，行数 50 亿。\",\"root_cause\":\"分区表缺少分区谓词时，Hive 会扫描全部历史分区，I/O 与解码成本随历史增长线性放大，对 500GB 量级表是最主要的耗时来源。\",\"recommendation\":\"在 WHERE 中显式加上 dt 分区过滤（如限定单日或近 N 日），让查询只扫描必要分区；切忌在 dt 上包裹函数（会导致分区裁剪失效）。\",\"expected_gain\":\"取决于历史分区数量，常见 10x~100x\"},{\"id\":\"ISSUE-002\",\"category\":\"sql_anti_pattern\",\"severity\":\"high\",\"title\":\"SELECT * 列裁剪缺失，ORC 列存优势失效\",\"evidence\":\"SQL 第 1 行 `select * from dwd_order`，且 DDL `STORED AS ORC`。\",\"root_cause\":\"ORC 是列式存储，SELECT * 会读取所有列，无法享受列裁剪带来的 I/O 节省；同时增加后续 shuffle/排序的数据体积。\",\"recommendation\":\"按下游真实需要显式列出字段，仅查询业务必需列，最大化利用 ORC 列裁剪。\",\"expected_gain\":\"2x~5x（取决于实际使用列占总列数比例）\"},{\"id\":\"ISSUE-003\",\"category\":\"sql_anti_pattern\",\"severity\":\"critical\",\"title\":\"全局 ORDER BY 无 LIMIT，单 Reducer 排序成为瓶颈\",\"evidence\":\"SQL 末尾 `order by create_time desc;`，没有 LIMIT 子句。\",\"root_cause\":\"Hive 的 ORDER BY 是全局排序，会强制收敛到 1 个 Reducer。在 500GB / 50 亿行规模下，单 Reducer 排序几乎必然成为长尾，且很容易 OOM 或超时。\",\"recommendation\":\"如果只取 TopN，加上 LIMIT，Hive 会触发 TopN 优化避免单 Reducer 全量排序；如果是导出场景且不需要严格全局有序，考虑 SORT BY（每 Reducer 内有序）或 DISTRIBUTE BY + SORT BY；如确需全局排序，至少配合分区裁剪先把数据量压下来。\",\"expected_gain\":\"5x~20x（配合 LIMIT 时收益最大）\"}],\"needs_human_check\":[\"确认该 SQL 真实业务诉求是否需要\"全局有序\"的全量结果，还是只需 TopN，从而决定保留 ORDER BY+LIMIT 还是改为 SORT BY。\",\"确认下游真正使用了 dwd_order 的哪些列，以替换 SELECT *。\",\"确认合理的 dt 时间窗口（例如近 1 日/近 7 日），用于补齐分区过滤条件。\"],\"markdown_report\":\"## 总结\\n该 SQL 在 500GB / 50 亿行级别的 ORC 分区表上，同时踩中三大反模式：分区裁剪缺失、SELECT *、ORDER BY 无 LIMIT，是典型的\"扫全表 + 单 Reducer 排序\"长任务模式，仅靠 SQL 写法修正即可获得数量级提升。\\n\\n## 问题列表\\n\\n### ISSUE-001 分区表未使用分区字段过滤（critical, partition_pruning）\\n- **证据**：DDL `PARTITIONED BY (dt string)`，SQL 没有任何 WHERE 条件，未过滤 dt。表容量 500GB / 50 亿行。\\n- **根因**：Hive 会扫描所\n```",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning ; select 星号 ; select star column pruning ; order by 全局排序 无 limit ; order by no limit global sort",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-050] 全局 ORDER BY 无 LIMIT",
+        "## [CASE-001] 大表 ORDER BY 全局排序",
+        "## 知识卡索引",
+        "### 排序语法对比",
+        "### 问题诊断",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 34.6,
+      "node4_usage": {
+        "completion_tokens": 2170,
+        "prompt_tokens": 5984,
+        "total_tokens": 8154,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"500GB 大表 dwd_order 未做分区裁剪、使用 SELECT * 且 ORDER BY 全局排序无 LIMIT，导致全表扫描后单 Reducer 排序，资源极度浪费。\",\"severity\":\"critical\",\"estimated_speedup\":\"10x~50x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"partition_pruning\",\"severity\":\"critical\",\"title\":\"分区表未使用分区字段过滤，全表扫描所有历史分区\",\"evidence\":\"DDL 中 `PARTITIONED "
+    }
+  },
+  {
+    "model": "glm-5.1",
+    "case_id": 5,
+    "case_label": "CASE-5 same table scanned 3 times",
+    "score": {
+      "hit_categories": [
+        "subquery"
+      ],
+      "missing": [],
+      "extra": [
+        "partition_pruning"
+      ],
+      "score": 0.75,
+      "issue_count": 2
+    },
+    "result_json": {
+      "summary": "FCT_ACTIVITY 表被三次重复扫描进行 LEFT JOIN，且子查询表 FCT_ACTIVITY 缺少分区/过滤条件导致全表扫描，是导致任务超长的核心 SQL 写法问题。",
+      "severity": "high",
+      "estimated_speedup": "3x~5x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "subquery",
+          "severity": "high",
+          "title": "FCT_ACTIVITY 表被重复扫描 3 次",
+          "evidence": "SQL 中三个子查询 `select process_id from FCT_ACTIVITY where link_define_nm='answer-plan'`、`... 'intake'`、`... 'design-doc'` 分别 left join，FCT_ACTIVITY（容量 50GB，5000 万行）被引用 3 次。",
+          "root_cause": "每个子查询都会触发一次 50GB 大表的全量扫描，重复扫描成本是单次的 3 倍；Hive 引擎不会自动合并相同来源的子查询。",
+          "recommendation": "建议将三次 left join 合并为一次对 FCT_ACTIVITY 的扫描，使用条件聚合（如 `MAX(CASE WHEN link_define_nm='answer-plan' THEN 1 END)` 等）按 process_id 分组得到三个标志位，再与 fact_order 关联一次即可。这样可将 FCT_ACTIVITY 的 IO 从 3 次降为 1 次。",
+          "expected_gain": "3x 左右（IO 从 3 次降为 1 次）"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "partition_pruning",
+          "severity": "medium",
+          "title": "FCT_ACTIVITY 表无分区裁剪条件（潜在风险）",
+          "evidence": "DDL `CREATE TABLE FCT_ACTIVITY (process_id string, link_define_nm string, end_tm string) STORED AS ORC;` 显示 FCT_ACTIVITY 未定义分区字段；而 fact_order 已用 `b.dt='20250101'` 做了分区裁剪。",
+          "root_cause": "FCT_ACTIVITY 没有分区，导致每次 join 都要扫描全部 50GB 数据，无法像 fact_order 那样仅扫描单日分区，IO 成本被放大。",
+          "recommendation": "如果 FCT_ACTIVITY 业务上具有时间属性，建议在 DDL 层面增加日期分区（如 dt），并在 SQL 中按需裁剪；若无法改 DDL，可在子查询内增加 end_tm 等时间字段过滤，缩小扫描范围。属于结构性建议，需 DBA 配合。",
+          "expected_gain": "未知，取决于业务上是否能限定时间范围"
+        }
+      ],
+      "needs_human_check": [
+        "请抽样核查 FCT_ACTIVITY.process_id 与 fact_order.process_id 的关联基数：是否存在一对多导致 left join 后行数膨胀，从而拖慢任务。",
+        "请核查 FCT_ACTIVITY.link_define_nm 三个取值（answer-plan / intake / design-doc）是否会对同一 process_id 产生多行匹配，进而导致 join 后笛卡尔放大。",
+        "请核查 fact_order 单日分区 dt='20250101' 的实际数据量是否符合预期（DDL 显示总量 100GB）。",
+        "请确认 FCT_ACTIVITY 是否有可用的时间字段（如 end_tm）能够用于在子查询中加上时间范围过滤以降低扫描成本。"
+      ],
+      "markdown_report": "## 总结\n\n本 SQL 主要瓶颈在于 FCT_ACTIVITY 这张 50GB 大表被三个 LEFT JOIN 子查询分别扫描共 3 次，且该表本身没有分区，每次扫描都是全表扫描，IO 成本被放大三倍。fact_order 已正确使用了分区字段 dt 进行裁剪，无该问题。\n\n## 问题列表\n\n### ISSUE-001 FCT_ACTIVITY 表被重复扫描 3 次（subquery, high）\n\n- **证据**：SQL 中三个子查询 `select process_id from FCT_ACTIVITY where link_define_nm='answer-plan'`、`... 'intake'`、`... 'design-doc'` 分别 left join，FCT_ACTIVITY（50GB / 5000 万行）被引用 3 次。\n- **根因**：每个子查询都会触发一次 50GB 大表的全量扫描，重复扫描成本是单次的 3 倍。Hive 引擎不会自动合并相同来源的子查询。\n- **建议**：将三次 left join 合并为一次对 FCT_ACTIVITY 的扫描，使用条件聚合（CASE WHEN + MAX/分组）一次性输出三个标志列，再与 fact_order 关联。可将 FCT_ACTIVITY 的扫描次数从 3 降为 1。\n- **预估收益**：3x 左右。\n\n### ISSUE-002 FCT_ACTIVITY 表无分区裁剪（partition_pruning, medium）\n\n- **证据**：DDL `CREATE TABLE FCT_ACTIVITY (...) STORED AS ORC;` 未定义 PARTITIONED BY；而 fact_order 已用 `b.dt='20250101'` 做了分区裁剪。\n- **根因**：FCT_ACTIVITY 没有分区，每次 join 都要扫全表 50GB，无法做分区裁剪。\n- **建议**：DDL 层面建议为 FCT_ACTIVITY 增加日期分区；SQL 层面如该表存在 end_tm 等时间字段，可在子查询里增加时间过滤条件，减少扫描范围。\n- **预估收益**：未知，取决于业务能否限定时间范围。\n\n## 需人工核查项\n\n1. 抽样核查 FCT_ACTIVITY.process_id 与 fact_order.process_id 的关联基数，是否一对多导致 left join 行数膨胀。\n2. 同一 process_id 在 FCT_ACTIVITY 中三种 link_define_nm 是否会产生多行匹配，引发 join 放大。\n3. fact_order 单日分区 dt='20250101' 的实际数据量是否符合预期。\n4. 确认 FCT_ACTIVITY 是否存在时间字段可作为额外过滤条件。\n\n## 预估收益\n\n仅做 SQL 写法层优化（合并 FCT_ACTIVITY 三次扫描为一次）即可获得约 3x~5x 提速；若同时能在 FCT_ACTIVITY 上添加分区或时间过滤，收益会更明显。"
+    },
+    "result_markdown": "## 总结\n\n本 SQL 主要瓶颈在于 FCT_ACTIVITY 这张 50GB 大表被三个 LEFT JOIN 子查询分别扫描共 3 次，且该表本身没有分区，每次扫描都是全表扫描，IO 成本被放大三倍。fact_order 已正确使用了分区字段 dt 进行裁剪，无该问题。\n\n## 问题列表\n\n### ISSUE-001 FCT_ACTIVITY 表被重复扫描 3 次（subquery, high）\n\n- **证据**：SQL 中三个子查询 `select process_id from FCT_ACTIVITY where link_define_nm='answer-plan'`、`... 'intake'`、`... 'design-doc'` 分别 left join，FCT_ACTIVITY（50GB / 5000 万行）被引用 3 次。\n- **根因**：每个子查询都会触发一次 50GB 大表的全量扫描，重复扫描成本是单次的 3 倍。Hive 引擎不会自动合并相同来源的子查询。\n- **建议**：将三次 left join 合并为一次对 FCT_ACTIVITY 的扫描，使用条件聚合（CASE WHEN + MAX/分组）一次性输出三个标志列，再与 fact_order 关联。可将 FCT_ACTIVITY 的扫描次数从 3 降为 1。\n- **预估收益**：3x 左右。\n\n### ISSUE-002 FCT_ACTIVITY 表无分区裁剪（partition_pruning, medium）\n\n- **证据**：DDL `CREATE TABLE FCT_ACTIVITY (...) STORED AS ORC;` 未定义 PARTITIONED BY；而 fact_order 已用 `b.dt='20250101'` 做了分区裁剪。\n- **根因**：FCT_ACTIVITY 没有分区，每次 join 都要扫全表 50GB，无法做分区裁剪。\n- **建议**：DDL 层面建议为 FCT_ACTIVITY 增加日期分区；SQL 层面如该表存在 end_tm 等时间字段，可在子查询里增加时间过滤条件，减少扫描范围。\n- **预估收益**：未知，取决于业务能否限定时间范围。\n\n## 需人工核查项\n\n1. 抽样核查 FCT_ACTIVITY.process_id 与 fact_order.process_id 的关联基数，是否一对多导致 left join 行数膨胀。\n2. 同一 process_id 在 FCT_ACTIVITY 中三种 link_define_nm 是否会产生多行匹配，引发 join 放大。\n3. fact_order 单日分区 dt='20250101' 的实际数据量是否符合预期。\n4. 确认 FCT_ACTIVITY 是否存在时间字段可作为额外过滤条件。\n\n## 预估收益\n\n仅做 SQL 写法层优化（合并 FCT_ACTIVITY 三次扫描为一次）即可获得约 3x~5x 提速；若同时能在 FCT_ACTIVITY 上添加分区或时间过滤，收益会更明显。",
+    "stages": {
+      "node2_retrieval_query": "同表重复扫描 ; repeated table scan grouping sets",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [CASE-004] 同表重复扫描",
+        "## [KB-033] 同表多次扫描应 CASE WHEN 合并",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [CASE-010] OR 逻辑错误导致全表扫描",
+        "## 真实案例索引",
+        "### 根因"
+      ],
+      "node4_elapsed_s": 33.6,
+      "node4_usage": {
+        "completion_tokens": 2431,
+        "prompt_tokens": 5737,
+        "total_tokens": 8168,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"FCT_ACTIVITY 表被三次重复扫描进行 LEFT JOIN，且子查询表 FCT_ACTIVITY 缺少分区/过滤条件导致全表扫描，是导致任务超长的核心 SQL 写法问题。\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"3x~5x\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"subquery\",\n      \"severity\": \"high\",\n      \"title\": \"FCT_ACTIVITY 表被重复扫描 3"
+    }
+  },
+  {
+    "model": "glm-5.1",
+    "case_id": 6,
+    "case_label": "CASE-6 UNION should be UNION ALL",
+    "score": {
+      "hit_categories": [
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 使用 UNION 触发隐式全局去重，建议改为 UNION ALL（业务允许时）或 UNION ALL + GROUP BY",
+      "severity": "low",
+      "estimated_speedup": "1.5x~2x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "UNION 隐式去重导致额外 Shuffle",
+          "evidence": "SQL 中 `... where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，两段查询之间使用的是 `union` 而非 `union all`",
+          "root_cause": "UNION 等价于 UNION ALL + 全局 DISTINCT，会多一次 Shuffle 去重；当前两段子查询分别取自 dt='20250101' 与 dt='20250102'，是不同分区的数据，单独看每段内部不会与对方重复（uid 在两天间是否重复属于业务语义），全局去重的开销在 1000 万行 + 10GB 数据规模下不可忽视",
+          "recommendation": "与业务方确认是否允许同一 uid 在两天各出现一次：1) 若允许重复或下游不依赖去重，直接改为 UNION ALL；2) 若必须去重，改为 UNION ALL 外层再 GROUP BY uid，可利用 Map 端预聚合，比 UNION 自带的 Reduce 端去重更高效。改动前请与业务方确认语义，避免破坏下游对重复行的预期",
+          "expected_gain": "1.5x~2x（取决于两天 uid 重叠度与集群 Shuffle 成本）"
+        }
+      ],
+      "needs_human_check": [
+        "请与业务方确认两天数据 union 的语义：是否允许同一 uid 在结果中重复出现，从而决定改为 UNION ALL 还是 UNION ALL + GROUP BY",
+        "建议人工核查 dwd_user_active 表 uid 字段在 dt='20250101' 与 dt='20250102' 两个分区的重叠比例，评估去重操作的实际开销"
+      ],
+      "markdown_report": "## 总结\n\n当前 SQL 在两段分区查询之间使用 `UNION`，会触发一次额外的全局去重 Shuffle。在 10GB / 1000 万行规模下，这部分开销显著且大概率是不必要的。除此之外，SQL 已正确使用了分区过滤（dt='20250101' / dt='20250102'），未出现 SELECT *、JOIN、ORDER BY、窗口函数、子查询、LIKE 模糊匹配等其他写法问题，存储格式为 ORC，也无需调整。\n\n## 问题列表\n\n### ISSUE-001 UNION 隐式去重导致额外 Shuffle（severity: low）\n\n- **分类**: sql_anti_pattern\n- **证据**: SQL 中 `... where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，两段查询之间使用的是 `union` 而非 `union all`\n- **根因**: `UNION` 等价于 `UNION ALL + 全局 DISTINCT`，会多一次 Reduce 端 Shuffle 去重。每段子查询内部不会自重复，去重开销主要发生在合并两天数据后的全局阶段，1000 万行规模下成本明显。\n- **建议**:\n  - 若业务允许重复或下游无强去重依赖：直接改为 `UNION ALL`\n  - 若必须去重：改为 `UNION ALL` 后外层 `GROUP BY uid`，可利用 Map 端预聚合，比 UNION 自带去重更高效\n  - 改动前请与业务方确认语义，避免破坏下游逻辑\n- **预估收益**: 1.5x~2x\n\n## 需人工核查项\n\n- 请与业务方确认两天 union 的语义：是否允许同一 uid 在结果中重复，决定改为 UNION ALL 还是 UNION ALL + GROUP BY\n- 建议人工核查 dwd_user_active 表 uid 在 dt='20250101' 与 dt='20250102' 两个分区的重叠比例，评估去重的实际成本\n\n## 预估收益\n\n仅 SQL 写法层面，保守预估 1.5x~2x，主要来自省去全局 DISTINCT 的 Shuffle。"
+    },
+    "result_markdown": "## 总结\n\n当前 SQL 在两段分区查询之间使用 `UNION`，会触发一次额外的全局去重 Shuffle。在 10GB / 1000 万行规模下，这部分开销显著且大概率是不必要的。除此之外，SQL 已正确使用了分区过滤（dt='20250101' / dt='20250102'），未出现 SELECT *、JOIN、ORDER BY、窗口函数、子查询、LIKE 模糊匹配等其他写法问题，存储格式为 ORC，也无需调整。\n\n## 问题列表\n\n### ISSUE-001 UNION 隐式去重导致额外 Shuffle（severity: low）\n\n- **分类**: sql_anti_pattern\n- **证据**: SQL 中 `... where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，两段查询之间使用的是 `union` 而非 `union all`\n- **根因**: `UNION` 等价于 `UNION ALL + 全局 DISTINCT`，会多一次 Reduce 端 Shuffle 去重。每段子查询内部不会自重复，去重开销主要发生在合并两天数据后的全局阶段，1000 万行规模下成本明显。\n- **建议**:\n  - 若业务允许重复或下游无强去重依赖：直接改为 `UNION ALL`\n  - 若必须去重：改为 `UNION ALL` 后外层 `GROUP BY uid`，可利用 Map 端预聚合，比 UNION 自带去重更高效\n  - 改动前请与业务方确认语义，避免破坏下游逻辑\n- **预估收益**: 1.5x~2x\n\n## 需人工核查项\n\n- 请与业务方确认两天 union 的语义：是否允许同一 uid 在结果中重复，决定改为 UNION ALL 还是 UNION ALL + GROUP BY\n- 建议人工核查 dwd_user_active 表 uid 在 dt='20250101' 与 dt='20250102' 两个分区的重叠比例，评估去重的实际成本\n\n## 预估收益\n\n仅 SQL 写法层面，保守预估 1.5x~2x，主要来自省去全局 DISTINCT 的 Shuffle。",
+    "stages": {
+      "node2_retrieval_query": "UNION 隐式去重 ; UNION ALL deduplicate",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-030] UNION 应改 UNION ALL",
+        "## 知识卡索引",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 根因",
+        "### 根因",
+        "### 建议方向（不给出完整改写 SQL）"
+      ],
+      "node4_elapsed_s": 26.2,
+      "node4_usage": {
+        "completion_tokens": 1509,
+        "prompt_tokens": 5885,
+        "total_tokens": 7394,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"SQL 使用 UNION 触发隐式全局去重，建议改为 UNION ALL（业务允许时）或 UNION ALL + GROUP BY\",\"severity\":\"low\",\"estimated_speedup\":\"1.5x~2x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"low\",\"title\":\"UNION 隐式去重导致额外 Shuffle\",\"evidence\":\"SQL 中 `... where dt='20250101' union select uid from d"
+    }
+  },
+  {
+    "model": "glm-5.1",
+    "case_id": 7,
+    "case_label": "CASE-7 clean SQL (fallback)",
+    "score": {
+      "hit_categories": [],
+      "missing": [],
+      "extra": [
+        "sql_anti_pattern"
+      ],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 写法层面未发现明显问题，分区过滤已命中，字段已显式列出，无 JOIN/聚合/排序等高风险结构。",
+      "severity": "low",
+      "estimated_speedup": "未知（SQL 层面无明显改写空间）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "未发现明显写法问题",
+          "evidence": "SQL 仅为 `select order_id, amount from dwd_order where dt='20250101';`，已使用分区字段 dt 过滤，未使用 SELECT *，无 JOIN、无聚合、无 ORDER BY、无 UNION、无窗口函数、无子查询，存储格式为 ORC。",
+          "root_cause": "逐项走查 CHK-1 至 CHK-12 均不命中：CHK-1 已用分区字段 dt 过滤；CHK-2 显式列出字段；CHK-3 无 JOIN；CHK-4 无 count(distinct)；CHK-5 无 order by；CHK-6 无 union；CHK-7 仅扫描一次；CHK-8 无窗口函数；CHK-9 无 JOIN；CHK-10 无 like；CHK-11 ORC 而非 TEXTFILE；CHK-12 无 in 子查询。",
+          "recommendation": "SQL 写法层面无需改动。如任务确实运行超过 4 小时，建议从 SQL 之外的角度排查：分区 dt='20250101' 实际数据量、文件数与小文件情况、下游写入逻辑、集群资源争用等（不属于本次 SQL 写法诊断范围）。",
+          "expected_gain": "未知"
+        }
+      ],
+      "needs_human_check": [
+        "人工核查分区 dt='20250101' 实际数据量与文件数，确认是否存在小文件过多或单分区数据量异常的情况",
+        "人工核查执行计划（EXPLAIN）确认是否走了分区裁剪，以及实际读取的 input size",
+        "人工核查任务是否因为集群资源争用、队列排队或下游写入路径导致总耗时偏高，而非 SQL 写法问题"
+      ],
+      "markdown_report": "## 总结\n\n本 SQL 写法层面未发现明显问题。SQL 已使用分区字段 `dt` 过滤、显式列出所需字段、无 JOIN、无聚合、无排序、存储格式为 ORC。如任务运行超过 4 小时，瓶颈大概率不在 SQL 写法本身。\n\n## 问题列表\n\n### ISSUE-001 未发现明显写法问题（severity=low）\n\n- **证据**：SQL 全文 `select order_id, amount from dwd_order where dt='20250101';`；DDL `PARTITIONED BY (dt string) STORED AS ORC`。\n- **根因**：12 项 Checklist 全部不命中。\n  - CHK-1 分区剪枝：✅ 已用 `dt='20250101'` 过滤\n  - CHK-2 SELECT *：✅ 显式列出 order_id, amount\n  - CHK-3 大小表 JOIN：N/A，无 JOIN\n  - CHK-4 多 count(distinct)：N/A，无聚合\n  - CHK-5 ORDER BY 无 LIMIT：N/A\n  - CHK-6 UNION 去重：N/A\n  - CHK-7 重复扫描：N/A，仅一张表一次扫描\n  - CHK-8 窗口函数：N/A\n  - CHK-9 笛卡尔积：N/A\n  - CHK-10 LIKE '%xxx%'：N/A\n  - CHK-11 TEXTFILE：✅ 存储格式为 ORC\n  - CHK-12 IN 子查询：N/A\n- **建议**：SQL 写法层面无需改动。\n- **预估收益**：未知。\n\n## 需人工核查项\n\n- 分区 `dt='20250101'` 实际数据量、文件数，是否存在小文件过多\n- EXPLAIN 确认分区裁剪生效与实际 input size\n- 集群资源 / 队列 / 下游写入是否为真实瓶颈（非 SQL 写法范围）\n\n## 预估收益\n\nSQL 写法层面无明显改写空间，预估收益未知。建议从执行环境与数据分布维度继续排查。"
+    },
+    "result_markdown": "## 总结\n\n本 SQL 写法层面未发现明显问题。SQL 已使用分区字段 `dt` 过滤、显式列出所需字段、无 JOIN、无聚合、无排序、存储格式为 ORC。如任务运行超过 4 小时，瓶颈大概率不在 SQL 写法本身。\n\n## 问题列表\n\n### ISSUE-001 未发现明显写法问题（severity=low）\n\n- **证据**：SQL 全文 `select order_id, amount from dwd_order where dt='20250101';`；DDL `PARTITIONED BY (dt string) STORED AS ORC`。\n- **根因**：12 项 Checklist 全部不命中。\n  - CHK-1 分区剪枝：✅ 已用 `dt='20250101'` 过滤\n  - CHK-2 SELECT *：✅ 显式列出 order_id, amount\n  - CHK-3 大小表 JOIN：N/A，无 JOIN\n  - CHK-4 多 count(distinct)：N/A，无聚合\n  - CHK-5 ORDER BY 无 LIMIT：N/A\n  - CHK-6 UNION 去重：N/A\n  - CHK-7 重复扫描：N/A，仅一张表一次扫描\n  - CHK-8 窗口函数：N/A\n  - CHK-9 笛卡尔积：N/A\n  - CHK-10 LIKE '%xxx%'：N/A\n  - CHK-11 TEXTFILE：✅ 存储格式为 ORC\n  - CHK-12 IN 子查询：N/A\n- **建议**：SQL 写法层面无需改动。\n- **预估收益**：未知。\n\n## 需人工核查项\n\n- 分区 `dt='20250101'` 实际数据量、文件数，是否存在小文件过多\n- EXPLAIN 确认分区裁剪生效与实际 input size\n- 集群资源 / 队列 / 下游写入是否为真实瓶颈（非 SQL 写法范围）\n\n## 预估收益\n\nSQL 写法层面无明显改写空间，预估收益未知。建议从执行环境与数据分布维度继续排查。",
+    "stages": {
+      "node2_retrieval_query": "Hive SQL optimization ; select order_id, amount from dwd_order where dt='20250101';",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "### 问题 SQL",
+        "### 问题 SQL",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 问题 SQL（节选）",
+        "### 问题 SQL（节选）"
+      ],
+      "node4_elapsed_s": 23.7,
+      "node4_usage": {
+        "completion_tokens": 1515,
+        "prompt_tokens": 5862,
+        "total_tokens": 7377,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"SQL 写法层面未发现明显问题，分区过滤已命中，字段已显式列出，无 JOIN/聚合/排序等高风险结构。\",\"severity\":\"low\",\"estimated_speedup\":\"未知（SQL 层面无明显改写空间）\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"low\",\"title\":\"未发现明显写法问题\",\"evidence\":\"SQL 仅为 `select order_id, amount from dwd_order where dt='20250101';`，已使"
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 1,
+    "case_label": "CASE-1 big-small JOIN + select *",
+    "score": {
+      "hit_categories": [
+        "join_strategy",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 2
+    },
+    "result_json": {
+      "summary": "SQL 存在 SELECT * 反模式且小表 dim_user 未使用 MapJoin，导致不必要的列读取和 shuffle 开销",
+      "severity": "high",
+      "estimated_speedup": "3x~5x（保守估计，仅 SQL 改动）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "SELECT * 反模式",
+          "evidence": "SQL 第 1 行 `select a.*`，使用了表别名通配符",
+          "root_cause": "使用 SELECT * 会读取所有列，即使后续不需要，增加不必要的 IO 和内存消耗，且不利于列裁剪优化",
+          "recommendation": "建议明确列出需要的字段，如 `select a.order_id, a.user_id, a.amount`，只读取实际使用的列",
+          "expected_gain": "减少 IO，预估 1.2x~1.5x"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "join_strategy",
+          "severity": "high",
+          "title": "大小表 JOIN 未使用 MapJoin",
+          "evidence": "dim_user 容量仅 50MB，SQL 中 `left join dim_user b` 但没有 `/*+ MAPJOIN(b) */` 提示",
+          "root_cause": "小表 dim_user 未通过 MapJoin 广播到 map 端，导致大表 dwd_order 需要 shuffle 到 reducer 进行 join，产生大量网络和磁盘 IO",
+          "recommendation": "建议添加 MapJoin hint，如 `/*+ MAPJOIN(b) */`，将 dim_user 广播到每个 map 任务，避免 shuffle",
+          "expected_gain": "预估 3x~5x 性能提升"
+        }
+      ],
+      "needs_human_check": [
+        "left join 关联键 a.user_id 和 b.uid 是否存在大量 NULL 或空字符串，请抽样核查，避免产生数据倾斜"
+      ],
+      "markdown_report": "## 总结\nSQL 存在两个主要问题：使用 `SELECT *` 导致不必要的列读取，以及小表 dim_user 未使用 MapJoin 导致大表 shuffle，严重影响性能。\n\n## 问题列表\n### ISSUE-001 SELECT * 反模式\n- **证据**：SQL 第 1 行 `select a.*`\n- **根因**：使用通配符读取所有列，增加 IO 和内存开销，且无法利用列裁剪优化\n- **建议**：明确列出需要的字段，如 `select a.order_id, a.user_id, a.amount`\n- **预估收益**：1.2x~1.5x\n\n### ISSUE-002 大小表 JOIN 未使用 MapJoin\n- **证据**：dim_user 容量仅 50MB，SQL 中 `left join dim_user b` 但没有 `/*+ MAPJOIN(b) */` 提示\n- **根因**：小表未广播，导致大表 dwd_order 需要 shuffle 到 reducer 进行 join，产生大量网络和磁盘 IO\n- **建议**：添加 MapJoin hint，如 `/*+ MAPJOIN(b) */`，将 dim_user 广播到 map 端\n- **预估收益**：3x~5x\n\n## 需人工核查项\n- left join 关联键 a.user_id 和 b.uid 是否存在大量 NULL 或空字符串，请抽样核查，避免产生数据倾斜\n\n## 预估收益\n通过消除 SELECT * 和添加 MapJoin，整体性能预计提升 3x~5x（保守估计）"
+    },
+    "result_markdown": "## 总结\nSQL 存在两个主要问题：使用 `SELECT *` 导致不必要的列读取，以及小表 dim_user 未使用 MapJoin 导致大表 shuffle，严重影响性能。\n\n## 问题列表\n### ISSUE-001 SELECT * 反模式\n- **证据**：SQL 第 1 行 `select a.*`\n- **根因**：使用通配符读取所有列，增加 IO 和内存开销，且无法利用列裁剪优化\n- **建议**：明确列出需要的字段，如 `select a.order_id, a.user_id, a.amount`\n- **预估收益**：1.2x~1.5x\n\n### ISSUE-002 大小表 JOIN 未使用 MapJoin\n- **证据**：dim_user 容量仅 50MB，SQL 中 `left join dim_user b` 但没有 `/*+ MAPJOIN(b) */` 提示\n- **根因**：小表未广播，导致大表 dwd_order 需要 shuffle 到 reducer 进行 join，产生大量网络和磁盘 IO\n- **建议**：添加 MapJoin hint，如 `/*+ MAPJOIN(b) */`，将 dim_user 广播到 map 端\n- **预估收益**：3x~5x\n\n## 需人工核查项\n- left join 关联键 a.user_id 和 b.uid 是否存在大量 NULL 或空字符串，请抽样核查，避免产生数据倾斜\n\n## 预估收益\n通过消除 SELECT * 和添加 MapJoin，整体性能预计提升 3x~5x（保守估计）",
+    "stages": {
+      "node2_retrieval_query": "select 星号 ; select star column pruning ; 小表 JOIN MapJoin ; MapJoin broadcast small table",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-020] 大小表 JOIN 未走 MapJoin",
+        "## 知识卡索引",
+        "## [KB-034] 嵌套子查询 / 老式逗号 JOIN",
+        "## [CASE-002] 多表 LEFT JOIN 中间结果膨胀",
+        "### 建议方向",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 54.0,
+      "node4_usage": {
+        "completion_tokens": 1828,
+        "prompt_tokens": 3699,
+        "total_tokens": 5527,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1002
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 存在 SELECT * 反模式且小表 dim_user 未使用 MapJoin，导致不必要的列读取和 shuffle 开销\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"3x~5x（保守估计，仅 SQL 改动）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"sql_anti_pattern\",\n      \"severity\": \"medium\",\n      \"title\": \"SELECT * 反模式\",\n     "
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 2,
+    "case_label": "CASE-2 missing partition filter",
+    "score": {
+      "hit_categories": [
+        "partition_pruning"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "查询未使用分区字段 dt 过滤，导致扫描全表 500GB 数据，性能极差",
+      "severity": "high",
+      "estimated_speedup": "10x~100x（取决于实际分区数和过滤后数据量）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "high",
+          "title": "分区表未使用分区字段过滤，导致全表扫描",
+          "evidence": "表 dwd_order DDL 中明确声明 PARTITIONED BY (dt string)，但 SQL 的 WHERE 条件仅使用 create_time >= '2024-01-01'，未出现 dt 过滤条件。表容量 500GB，行数 50 亿，全表扫描代价极高。",
+          "root_cause": "Hive 分区表的分区裁剪依赖 WHERE 子句中对分区字段的直接引用，当前 SQL 未使用 dt 过滤，优化器无法进行分区裁剪，导致扫描所有分区。",
+          "recommendation": "在 WHERE 条件中增加对分区字段 dt 的过滤，例如 `where dt >= '2024-01-01' and create_time >= '2024-01-01'`。需确保 dt 分区值与 create_time 的对应关系，避免漏数据。",
+          "expected_gain": "10x~100x（若 dt 按天分区，仅扫描少量分区，数据量可降至数 GB 级别）"
+        }
+      ],
+      "needs_human_check": [
+        "请确认 dwd_order 表的分区字段 dt 与 create_time 的映射关系，例如 dt 是否等于 create_time 的日期部分，以便添加正确的分区过滤条件。",
+        "若 create_time 与 dt 不完全一致，需评估是否可以通过 dt 范围过滤来近似裁剪，或考虑调整表分区策略。"
+      ],
+      "markdown_report": "## 总结\n查询 `select order_id, amount from dwd_order where create_time >= '2024-01-01'` 未利用分区字段 `dt` 进行过滤，导致扫描全表 500GB 数据，是性能瓶颈的根本原因。\n\n## 问题列表\n### ISSUE-001 分区表未使用分区字段过滤，导致全表扫描\n- **证据**：表 `dwd_order` DDL 含 `PARTITIONED BY (dt string)`，SQL 中 WHERE 条件仅 `create_time >= '2024-01-01'`，未出现 `dt` 过滤。表容量 500GB，行数 50 亿。\n- **根因**：Hive 分区裁剪依赖分区字段的显式过滤，缺失时优化器无法跳过无关分区，导致全表扫描。\n- **建议**：在 WHERE 中增加对 `dt` 的过滤，例如 `where dt >= '2024-01-01' and create_time >= '2024-01-01'`。需确保 `dt` 与 `create_time` 的对应关系正确。\n- **预估收益**：若 `dt` 按天分区，仅扫描少量分区，数据量可降至数 GB，性能提升 10~100 倍。\n\n## 需人工核查项\n- 确认 `dt` 分区值与 `create_time` 的映射关系，以便添加正确的分区过滤条件。\n- 若 `create_time` 与 `dt` 不完全一致，需评估是否可以通过 `dt` 范围过滤来近似裁剪，或考虑调整表分区策略。\n\n## 预估收益\n通过添加分区过滤，预计查询性能可提升 10~100 倍，具体取决于实际分区数和过滤后数据量。"
+    },
+    "result_markdown": "## 总结\n查询 `select order_id, amount from dwd_order where create_time >= '2024-01-01'` 未利用分区字段 `dt` 进行过滤，导致扫描全表 500GB 数据，是性能瓶颈的根本原因。\n\n## 问题列表\n### ISSUE-001 分区表未使用分区字段过滤，导致全表扫描\n- **证据**：表 `dwd_order` DDL 含 `PARTITIONED BY (dt string)`，SQL 中 WHERE 条件仅 `create_time >= '2024-01-01'`，未出现 `dt` 过滤。表容量 500GB，行数 50 亿。\n- **根因**：Hive 分区裁剪依赖分区字段的显式过滤，缺失时优化器无法跳过无关分区，导致全表扫描。\n- **建议**：在 WHERE 中增加对 `dt` 的过滤，例如 `where dt >= '2024-01-01' and create_time >= '2024-01-01'`。需确保 `dt` 与 `create_time` 的对应关系正确。\n- **预估收益**：若 `dt` 按天分区，仅扫描少量分区，数据量可降至数 GB，性能提升 10~100 倍。\n\n## 需人工核查项\n- 确认 `dt` 分区值与 `create_time` 的映射关系，以便添加正确的分区过滤条件。\n- 若 `create_time` 与 `dt` 不完全一致，需评估是否可以通过 `dt` 范围过滤来近似裁剪，或考虑调整表分区策略。\n\n## 预估收益\n通过添加分区过滤，预计查询性能可提升 10~100 倍，具体取决于实际分区数和过滤后数据量。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-011] 分区裁剪缺失",
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-004] 动态分区写入长尾",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [KB-010] 列裁剪缺失（SELECT *）",
+        "## 知识卡索引"
+      ],
+      "node4_elapsed_s": 36.7,
+      "node4_usage": {
+        "completion_tokens": 1213,
+        "prompt_tokens": 3413,
+        "total_tokens": 4626,
+        "prompt_tokens_details": {
+          "cached_tokens": 2048
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 385
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"查询未使用分区字段 dt 过滤，导致扫描全表 500GB 数据，性能极差\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"10x~100x（取决于实际分区数和过滤后数据量）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"partition_pruning\",\n      \"severity\": \"high\",\n      \"title\": \"分区表未使用分区字段过滤，导致全表扫描\",\n      \"evidence\": \"表 dw"
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 3,
+    "case_label": "CASE-3 multi count(distinct)",
+    "score": {
+      "hit_categories": [
+        "aggregation"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 中同时使用了两个 COUNT(DISTINCT)，导致单 Reducer 瓶颈，建议拆分改写以提升并行度。",
+      "severity": "high",
+      "estimated_speedup": "2x~5x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "aggregation",
+          "severity": "high",
+          "title": "多个 COUNT(DISTINCT) 导致单 Reducer 瓶颈",
+          "evidence": "SQL 中同时使用了 count(distinct user_id) 和 count(distinct order_id)，表 dwd_order 容量 100GB，行数 1 亿。",
+          "root_cause": "Hive 在处理 COUNT(DISTINCT) 时，每个 DISTINCT 列都需要在一个 Reducer 中完成全局去重，多个 DISTINCT 会串行执行，无法利用并行度，且大数据量下单 Reducer 处理压力大，容易成为性能瓶颈。",
+          "recommendation": "建议将多个 COUNT(DISTINCT) 拆分为多个子查询分别计算，然后通过 JOIN 或 UNION ALL 合并结果。例如，可以分别计算 user_id 和 order_id 的去重计数，再合并。避免在一个查询中使用多个 COUNT(DISTINCT)。",
+          "expected_gain": "预计可提升 2~5 倍性能，具体取决于数据分布和集群资源。"
+        }
+      ],
+      "needs_human_check": [
+        "建议人工核查 user_id 和 order_id 字段是否存在大量 NULL 值或空字符串，这可能导致额外的数据倾斜，影响去重性能。"
+      ],
+      "markdown_report": "## 总结\n本次 SQL 诊断发现一个关键性能问题：使用了多个 COUNT(DISTINCT)，导致单 Reducer 瓶颈。建议拆分改写以提升并行度。\n\n## 问题列表\n### ISSUE-001 多个 COUNT(DISTINCT) 导致单 Reducer 瓶颈\n- **证据**：SQL 中同时使用了 `count(distinct user_id)` 和 `count(distinct order_id)`，表 `dwd_order` 容量 100GB，行数 1 亿。\n- **根因**：Hive 在处理 COUNT(DISTINCT) 时，每个 DISTINCT 列都需要在一个 Reducer 中完成全局去重，多个 DISTINCT 会串行执行，无法利用并行度，且大数据量下单 Reducer 处理压力大，容易成为性能瓶颈。\n- **建议**：将多个 COUNT(DISTINCT) 拆分为多个子查询分别计算，然后通过 JOIN 或 UNION ALL 合并结果。例如，可以分别计算 user_id 和 order_id 的去重计数，再合并。避免在一个查询中使用多个 COUNT(DISTINCT)。\n- **预估收益**：2~5 倍性能提升。\n\n## 需人工核查项\n- 建议人工核查 `user_id` 和 `order_id` 字段是否存在大量 NULL 值或空字符串，这可能导致额外的数据倾斜，影响去重性能。\n\n## 预估收益\n整体优化后，预计该 SQL 执行时间可缩短至原来的 1/2 到 1/5，具体取决于数据分布和集群资源。"
+    },
+    "result_markdown": "## 总结\n本次 SQL 诊断发现一个关键性能问题：使用了多个 COUNT(DISTINCT)，导致单 Reducer 瓶颈。建议拆分改写以提升并行度。\n\n## 问题列表\n### ISSUE-001 多个 COUNT(DISTINCT) 导致单 Reducer 瓶颈\n- **证据**：SQL 中同时使用了 `count(distinct user_id)` 和 `count(distinct order_id)`，表 `dwd_order` 容量 100GB，行数 1 亿。\n- **根因**：Hive 在处理 COUNT(DISTINCT) 时，每个 DISTINCT 列都需要在一个 Reducer 中完成全局去重，多个 DISTINCT 会串行执行，无法利用并行度，且大数据量下单 Reducer 处理压力大，容易成为性能瓶颈。\n- **建议**：将多个 COUNT(DISTINCT) 拆分为多个子查询分别计算，然后通过 JOIN 或 UNION ALL 合并结果。例如，可以分别计算 user_id 和 order_id 的去重计数，再合并。避免在一个查询中使用多个 COUNT(DISTINCT)。\n- **预估收益**：2~5 倍性能提升。\n\n## 需人工核查项\n- 建议人工核查 `user_id` 和 `order_id` 字段是否存在大量 NULL 值或空字符串，这可能导致额外的数据倾斜，影响去重性能。\n\n## 预估收益\n整体优化后，预计该 SQL 执行时间可缩短至原来的 1/2 到 1/5，具体取决于数据分布和集群资源。",
+    "stages": {
+      "node2_retrieval_query": "count distinct 多字段 ; count distinct skew",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-031] COUNT(DISTINCT) 单 Reducer",
+        "## 知识卡索引",
+        "### 问题诊断",
+        "## 真实案例索引",
+        "## [KB-002] DISTINCT 单点瓶颈"
+      ],
+      "node4_elapsed_s": 51.6,
+      "node4_usage": {
+        "completion_tokens": 1845,
+        "prompt_tokens": 3685,
+        "total_tokens": 5530,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1134
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 中同时使用了两个 COUNT(DISTINCT)，导致单 Reducer 瓶颈，建议拆分改写以提升并行度。\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"2x~5x\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"aggregation\",\n      \"severity\": \"high\",\n      \"title\": \"多个 COUNT(DISTINCT) 导致单 Reducer 瓶颈\",\n      \"evidenc"
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 4,
+    "case_label": "CASE-4 ORDER BY no LIMIT + select *",
+    "score": {
+      "hit_categories": [
+        "partition_pruning",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 3
+    },
+    "result_json": {
+      "summary": "SQL 存在三个严重问题：未使用分区过滤导致全表扫描 500GB、SELECT * 导致列裁剪缺失、ORDER BY 无 LIMIT 导致单 Reducer 全局排序 50 亿行。",
+      "severity": "critical",
+      "estimated_speedup": "10x 以上（保守估计，仅 SQL 改动）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "critical",
+          "title": "分区表未使用分区过滤导致全表扫描",
+          "evidence": "dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL 中没有 WHERE 子句，未对 dt 做任何过滤。",
+          "root_cause": "未利用分区裁剪，导致扫描所有历史分区，表容量 500GB，行数 50 亿，全表扫描代价极高。",
+          "recommendation": "在 WHERE 中添加 dt 分区过滤条件，例如 `WHERE dt = '2025-01-01'`，确保只读取需要的分区。",
+          "expected_gain": "扫描数据量可降至单个分区大小，预计提升 10x 以上。"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "sql_anti_pattern",
+          "severity": "high",
+          "title": "SELECT * 导致列裁剪缺失",
+          "evidence": "SQL 第 1 行 `select *`，读取所有列。",
+          "root_cause": "读取全部列（order_id, create_time 以及可能存在的其他列），增加不必要的 IO 和网络传输，尤其在大表上浪费严重。",
+          "recommendation": "明确指定需要的列，例如 `SELECT order_id, create_time`，避免读取无用列。",
+          "expected_gain": "减少列读取量，提升查询效率。"
+        },
+        {
+          "id": "ISSUE-003",
+          "category": "sql_anti_pattern",
+          "severity": "high",
+          "title": "ORDER BY 全局排序无 LIMIT",
+          "evidence": "SQL 末尾 `order by create_time desc;` 没有 LIMIT 子句。",
+          "root_cause": "ORDER BY 会强制使用单个 Reducer 进行全局排序，处理 50 亿行数据，极易导致单点瓶颈、内存溢出或运行超时。",
+          "recommendation": "如果不需要全局有序，改用 SORT BY 实现局部有序；如果只需要 Top N 结果，添加 `LIMIT N`。",
+          "expected_gain": "避免单 Reducer 瓶颈，大幅降低排序开销，预计提升 10x 以上。"
+        }
+      ],
+      "needs_human_check": [
+        "请确认是否真的需要全量数据按 create_time 降序排列，还是只需要最近一段时间的数据。",
+        "请确认分区字段 dt 的合理过滤范围，避免误扫历史分区。"
+      ],
+      "markdown_report": "## 总结\nSQL 存在三个严重问题：未使用分区过滤导致全表扫描 500GB、SELECT * 导致列裁剪缺失、ORDER BY 无 LIMIT 导致单 Reducer 全局排序 50 亿行。综合严重度为 critical，仅通过 SQL 写法优化预计可提升 10 倍以上性能。\n\n## 问题列表\n### ISSUE-001 分区表未使用分区过滤导致全表扫描\n- **证据**：dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL 中没有 WHERE 子句，未对 dt 做任何过滤。\n- **根因**：未利用分区裁剪，导致扫描所有历史分区，表容量 500GB，行数 50 亿，全表扫描代价极高。\n- **建议**：在 WHERE 中添加 dt 分区过滤条件，例如 `WHERE dt = '2025-01-01'`，确保只读取需要的分区。\n- **预估收益**：扫描数据量可降至单个分区大小，预计提升 10x 以上。\n\n### ISSUE-002 SELECT * 导致列裁剪缺失\n- **证据**：SQL 第 1 行 `select *`，读取所有列。\n- **根因**：读取全部列（order_id, create_time 以及可能存在的其他列），增加不必要的 IO 和网络传输，尤其在大表上浪费严重。\n- **建议**：明确指定需要的列，例如 `SELECT order_id, create_time`，避免读取无用列。\n- **预估收益**：减少列读取量，提升查询效率。\n\n### ISSUE-003 ORDER BY 全局排序无 LIMIT\n- **证据**：SQL 末尾 `order by create_time desc;` 没有 LIMIT 子句。\n- **根因**：ORDER BY 会强制使用单个 Reducer 进行全局排序，处理 50 亿行数据，极易导致单点瓶颈、内存溢出或运行超时。\n- **建议**：如果不需要全局有序，改用 SORT BY 实现局部有序；如果只需要 Top N 结果，添加 `LIMIT N`。\n- **预估收益**：避免单 Reducer 瓶颈，大幅降低排序开销，预计提升 10x 以上。\n\n## 需人工核查项\n- 请确认是否真的需要全量数据按 create_time 降序排列，还是只需要最近一段时间的数据。\n- 请确认分区字段 dt 的合理过滤范围，避免误扫历史分区。\n\n## 预估收益\n仅通过 SQL 写法优化（添加分区过滤、指定列、添加 LIMIT 或改用 SORT BY），保守估计性能可提升 10 倍以上，具体倍数取决于实际分区大小和所需结果集大小。"
+    },
+    "result_markdown": "## 总结\nSQL 存在三个严重问题：未使用分区过滤导致全表扫描 500GB、SELECT * 导致列裁剪缺失、ORDER BY 无 LIMIT 导致单 Reducer 全局排序 50 亿行。综合严重度为 critical，仅通过 SQL 写法优化预计可提升 10 倍以上性能。\n\n## 问题列表\n### ISSUE-001 分区表未使用分区过滤导致全表扫描\n- **证据**：dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL 中没有 WHERE 子句，未对 dt 做任何过滤。\n- **根因**：未利用分区裁剪，导致扫描所有历史分区，表容量 500GB，行数 50 亿，全表扫描代价极高。\n- **建议**：在 WHERE 中添加 dt 分区过滤条件，例如 `WHERE dt = '2025-01-01'`，确保只读取需要的分区。\n- **预估收益**：扫描数据量可降至单个分区大小，预计提升 10x 以上。\n\n### ISSUE-002 SELECT * 导致列裁剪缺失\n- **证据**：SQL 第 1 行 `select *`，读取所有列。\n- **根因**：读取全部列（order_id, create_time 以及可能存在的其他列），增加不必要的 IO 和网络传输，尤其在大表上浪费严重。\n- **建议**：明确指定需要的列，例如 `SELECT order_id, create_time`，避免读取无用列。\n- **预估收益**：减少列读取量，提升查询效率。\n\n### ISSUE-003 ORDER BY 全局排序无 LIMIT\n- **证据**：SQL 末尾 `order by create_time desc;` 没有 LIMIT 子句。\n- **根因**：ORDER BY 会强制使用单个 Reducer 进行全局排序，处理 50 亿行数据，极易导致单点瓶颈、内存溢出或运行超时。\n- **建议**：如果不需要全局有序，改用 SORT BY 实现局部有序；如果只需要 Top N 结果，添加 `LIMIT N`。\n- **预估收益**：避免单 Reducer 瓶颈，大幅降低排序开销，预计提升 10x 以上。\n\n## 需人工核查项\n- 请确认是否真的需要全量数据按 create_time 降序排列，还是只需要最近一段时间的数据。\n- 请确认分区字段 dt 的合理过滤范围，避免误扫历史分区。\n\n## 预估收益\n仅通过 SQL 写法优化（添加分区过滤、指定列、添加 LIMIT 或改用 SORT BY），保守估计性能可提升 10 倍以上，具体倍数取决于实际分区大小和所需结果集大小。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning ; select 星号 ; select star column pruning ; order by 全局排序 无 limit ; order by no limit global sort",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-050] 全局 ORDER BY 无 LIMIT",
+        "## [CASE-001] 大表 ORDER BY 全局排序",
+        "## 知识卡索引",
+        "### 排序语法对比",
+        "### 问题诊断",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 59.9,
+      "node4_usage": {
+        "completion_tokens": 2172,
+        "prompt_tokens": 3672,
+        "total_tokens": 5844,
+        "prompt_tokens_details": {
+          "cached_tokens": 2048
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 883
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 存在三个严重问题：未使用分区过滤导致全表扫描 500GB、SELECT * 导致列裁剪缺失、ORDER BY 无 LIMIT 导致单 Reducer 全局排序 50 亿行。\",\n  \"severity\": \"critical\",\n  \"estimated_speedup\": \"10x 以上（保守估计，仅 SQL 改动）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"partition_pruning\",\n      \"severity\": \"critical\",\n   "
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 5,
+    "case_label": "CASE-5 same table scanned 3 times",
+    "score": {
+      "hit_categories": [
+        "subquery"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "FCT_ACTIVITY 表被重复扫描 3 次，导致大量冗余 IO，且 LEFT JOIN 未使用右表字段，疑似无效关联",
+      "severity": "high",
+      "estimated_speedup": "2x~3x（合并扫描或移除无效 JOIN）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "subquery",
+          "severity": "high",
+          "title": "同表 FCT_ACTIVITY 被重复扫描 3 次",
+          "evidence": "SQL 中三个 LEFT JOIN 子查询均来自 FCT_ACTIVITY 表，分别过滤 link_define_nm='answer-plan'、'intake'、'design-doc'，导致该表（50GB，5000 万行）被全表扫描 3 次",
+          "root_cause": "同一张表在多个子查询中被独立扫描，引擎无法自动合并，造成 3 倍的磁盘读取和网络传输开销",
+          "recommendation": "建议将三次扫描合并为一次，使用 CASE WHEN 或条件聚合在单次扫描中完成判断；若最终 SELECT 未使用右表字段，则这些 LEFT JOIN 可能完全多余，可直接移除",
+          "expected_gain": "2x~3x（减少约 2/3 的扫描数据量）"
+        }
+      ],
+      "needs_human_check": [
+        "LEFT JOIN 后未使用 c、d、e 任何字段，请确认这三个关联是否必要，若仅用于存在性判断，建议改用 EXISTS 或 IN 子查询",
+        "FCT_ACTIVITY 中同一 process_id 在相同 link_define_nm 下可能存在多条记录，LEFT JOIN 可能导致 fact_order 行数膨胀，请抽样核查"
+      ],
+      "markdown_report": "## 总结\n本次慢 SQL 的核心问题是 **FCT_ACTIVITY 表被重复扫描 3 次**，该表容量 50GB、5000 万行，三次独立子查询造成大量冗余 IO，且最终 SELECT 未使用右表任何字段，关联可能完全无效。\n\n## 问题列表\n### ISSUE-001 同表 FCT_ACTIVITY 被重复扫描 3 次\n- **证据**：SQL 中三个 LEFT JOIN 子查询均来自 `FCT_ACTIVITY`，分别过滤 `link_define_nm='answer-plan'`、`'intake'`、`'design-doc'`，导致该表被全表扫描 3 次。\n- **根因**：同一张表在多个子查询中被独立引用，引擎无法自动合并扫描，产生 3 倍的 IO 和网络开销。\n- **建议**：将三次扫描合并为一次，利用 `CASE WHEN` 或条件聚合在单次扫描中完成判断；若最终不需要右表字段，可直接移除这些 LEFT JOIN。\n- **预估收益**：2x~3x（减少约 2/3 的扫描数据量）。\n\n## 需人工核查项\n- LEFT JOIN 后未使用 c、d、e 任何字段，请确认这三个关联是否必要，若仅用于存在性判断，建议改用 `EXISTS` 或 `IN` 子查询。\n- FCT_ACTIVITY 中同一 `process_id` 在相同 `link_define_nm` 下可能存在多条记录，LEFT JOIN 可能导致 `fact_order` 行数膨胀，请抽样核查数据分布。\n\n## 预估收益\n通过消除重复扫描或移除无效 JOIN，预计整体执行时间可缩短至原来的 1/3 ~ 1/2，加速比约 2x~3x。"
+    },
+    "result_markdown": "## 总结\n本次慢 SQL 的核心问题是 **FCT_ACTIVITY 表被重复扫描 3 次**，该表容量 50GB、5000 万行，三次独立子查询造成大量冗余 IO，且最终 SELECT 未使用右表任何字段，关联可能完全无效。\n\n## 问题列表\n### ISSUE-001 同表 FCT_ACTIVITY 被重复扫描 3 次\n- **证据**：SQL 中三个 LEFT JOIN 子查询均来自 `FCT_ACTIVITY`，分别过滤 `link_define_nm='answer-plan'`、`'intake'`、`'design-doc'`，导致该表被全表扫描 3 次。\n- **根因**：同一张表在多个子查询中被独立引用，引擎无法自动合并扫描，产生 3 倍的 IO 和网络开销。\n- **建议**：将三次扫描合并为一次，利用 `CASE WHEN` 或条件聚合在单次扫描中完成判断；若最终不需要右表字段，可直接移除这些 LEFT JOIN。\n- **预估收益**：2x~3x（减少约 2/3 的扫描数据量）。\n\n## 需人工核查项\n- LEFT JOIN 后未使用 c、d、e 任何字段，请确认这三个关联是否必要，若仅用于存在性判断，建议改用 `EXISTS` 或 `IN` 子查询。\n- FCT_ACTIVITY 中同一 `process_id` 在相同 `link_define_nm` 下可能存在多条记录，LEFT JOIN 可能导致 `fact_order` 行数膨胀，请抽样核查数据分布。\n\n## 预估收益\n通过消除重复扫描或移除无效 JOIN，预计整体执行时间可缩短至原来的 1/3 ~ 1/2，加速比约 2x~3x。",
+    "stages": {
+      "node2_retrieval_query": "同表重复扫描 ; repeated table scan grouping sets",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [CASE-004] 同表重复扫描",
+        "## [KB-033] 同表多次扫描应 CASE WHEN 合并",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [CASE-010] OR 逻辑错误导致全表扫描",
+        "## 真实案例索引",
+        "### 根因"
+      ],
+      "node4_elapsed_s": 66.9,
+      "node4_usage": {
+        "completion_tokens": 2178,
+        "prompt_tokens": 3548,
+        "total_tokens": 5726,
+        "prompt_tokens_details": {
+          "cached_tokens": 2048
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1340
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"FCT_ACTIVITY 表被重复扫描 3 次，导致大量冗余 IO，且 LEFT JOIN 未使用右表字段，疑似无效关联\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"2x~3x（合并扫描或移除无效 JOIN）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"subquery\",\n      \"severity\": \"high\",\n      \"title\": \"同表 FCT_ACTIVITY 被重复扫描 3 次\",\n      "
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 6,
+    "case_label": "CASE-6 UNION should be UNION ALL",
+    "score": {
+      "hit_categories": [
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 使用 UNION 而非 UNION ALL，导致不必要的全局去重 Shuffle，增加任务耗时",
+      "severity": "low",
+      "estimated_speedup": "2x~3x（保守估计，仅 SQL 改动）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "使用 UNION 而非 UNION ALL 导致额外 Shuffle 去重",
+          "evidence": "SQL 中 `union select uid from dwd_user_active where dt='20250102'` 使用了 `union` 而非 `union all`",
+          "root_cause": "UNION 等价于 UNION ALL + DISTINCT，会触发一次全局 Shuffle 排序去重，而两个分区数据可能本身无重复或业务允许重复，该去重操作是多余的",
+          "recommendation": "建议与业务方确认是否需要去重：若无需去重，直接改为 UNION ALL；若需要去重，可考虑使用 UNION ALL 后外层 GROUP BY uid，通常比 UNION 更高效",
+          "expected_gain": "2x~3x（取决于数据量及重复率）"
+        }
+      ],
+      "needs_human_check": [
+        "请人工确认 dt='20250101' 与 dt='20250102' 两个分区的 uid 是否存在重复，以及下游是否依赖去重语义，以决定是否可改为 UNION ALL"
+      ],
+      "markdown_report": "## 总结\nSQL 使用 `UNION` 合并两个分区的 uid，该操作会进行全局去重，增加一次 Shuffle 排序，而两个分区数据可能无重复或业务允许重复，导致不必要的开销。\n\n## 问题列表\n### ISSUE-001 使用 UNION 而非 UNION ALL 导致额外 Shuffle 去重\n- **证据**：SQL 中 `union select uid from dwd_user_active where dt='20250102'` 使用了 `union` 而非 `union all`\n- **根因**：`UNION` = `UNION ALL` + 全局 DISTINCT，多一次 Shuffle 去重，开销大\n- **建议**：确认业务是否需要去重，若不需要则改为 `UNION ALL`；若需要去重，可改为 `UNION ALL` 后外层 `GROUP BY uid`，通常更高效\n- **预估收益**：2x~3x（取决于数据量及重复率）\n\n## 需人工核查项\n- 请人工确认 dt='20250101' 与 dt='20250102' 两个分区的 uid 是否存在重复，以及下游是否依赖去重语义，以决定是否可改为 UNION ALL\n\n## 预估收益\n通过将 UNION 改为 UNION ALL（或等价优化），预计可减少一次 Shuffle 排序，任务执行时间可缩短 2~3 倍。"
+    },
+    "result_markdown": "## 总结\nSQL 使用 `UNION` 合并两个分区的 uid，该操作会进行全局去重，增加一次 Shuffle 排序，而两个分区数据可能无重复或业务允许重复，导致不必要的开销。\n\n## 问题列表\n### ISSUE-001 使用 UNION 而非 UNION ALL 导致额外 Shuffle 去重\n- **证据**：SQL 中 `union select uid from dwd_user_active where dt='20250102'` 使用了 `union` 而非 `union all`\n- **根因**：`UNION` = `UNION ALL` + 全局 DISTINCT，多一次 Shuffle 去重，开销大\n- **建议**：确认业务是否需要去重，若不需要则改为 `UNION ALL`；若需要去重，可改为 `UNION ALL` 后外层 `GROUP BY uid`，通常更高效\n- **预估收益**：2x~3x（取决于数据量及重复率）\n\n## 需人工核查项\n- 请人工确认 dt='20250101' 与 dt='20250102' 两个分区的 uid 是否存在重复，以及下游是否依赖去重语义，以决定是否可改为 UNION ALL\n\n## 预估收益\n通过将 UNION 改为 UNION ALL（或等价优化），预计可减少一次 Shuffle 排序，任务执行时间可缩短 2~3 倍。",
+    "stages": {
+      "node2_retrieval_query": "UNION 隐式去重 ; UNION ALL deduplicate",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-030] UNION 应改 UNION ALL",
+        "## 知识卡索引",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 根因",
+        "### 根因",
+        "### 建议方向（不给出完整改写 SQL）"
+      ],
+      "node4_elapsed_s": 39.5,
+      "node4_usage": {
+        "completion_tokens": 1294,
+        "prompt_tokens": 3608,
+        "total_tokens": 4902,
+        "prompt_tokens_details": {
+          "cached_tokens": 2048
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 648
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 使用 UNION 而非 UNION ALL，导致不必要的全局去重 Shuffle，增加任务耗时\",\n  \"severity\": \"low\",\n  \"estimated_speedup\": \"2x~3x（保守估计，仅 SQL 改动）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"sql_anti_pattern\",\n      \"severity\": \"low\",\n      \"title\": \"使用 UNION 而非 UNION ALL 导致额外 Shuffle 去重\""
+    }
+  },
+  {
+    "model": "deepseek-v4-pro",
+    "case_id": 7,
+    "case_label": "CASE-7 clean SQL (fallback)",
+    "score": {
+      "hit_categories": [],
+      "missing": [],
+      "extra": [
+        "sql_anti_pattern"
+      ],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "该 SQL 写法简洁，已正确使用分区过滤，未发现明显 SQL 写法层面的问题。",
+      "severity": "low",
+      "estimated_speedup": "1x（无明显优化空间）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "未发现明显写法问题",
+          "evidence": "SQL 为单表查询，SELECT 仅指定所需字段，WHERE 条件使用了分区字段 dt='20250101'，表存储格式为 ORC，无 JOIN、无聚合、无排序、无子查询等复杂操作。",
+          "root_cause": "SQL 本身写法合理，未命中任何已知反模式。",
+          "recommendation": "当前写法已较优，无需调整。若执行仍慢，建议从数据分布、资源分配或执行计划层面排查。",
+          "expected_gain": "无"
+        }
+      ],
+      "needs_human_check": [
+        "建议人工核查该分区内的数据量及文件数，确认是否存在小文件过多或数据倾斜问题。",
+        "可查看执行计划，确认是否仅扫描了 dt='20250101' 分区，且无全表扫描。"
+      ],
+      "markdown_report": "## 总结\n该 SQL 为简单的单表分区查询，已正确使用分区过滤，SELECT 仅选取所需字段，存储格式为 ORC，未发现任何 SQL 写法层面的反模式或优化点。\n\n## 问题列表\n### ISSUE-001 未发现明显写法问题\n- **证据**：SQL 为 `select order_id, amount from dwd_order where dt='20250101';`，表 `dwd_order` 为 ORC 分区表，分区字段 `dt` 已用于过滤。\n- **根因**：SQL 写法本身合理，无 JOIN、无聚合、无排序、无子查询等复杂操作。\n- **建议**：当前写法已较优，无需调整。若执行仍慢，建议从数据分布、资源分配或执行计划层面排查。\n- **预估收益**：无\n\n## 需人工核查项\n- 建议人工核查该分区内的数据量及文件数，确认是否存在小文件过多或数据倾斜问题。\n- 可查看执行计划，确认是否仅扫描了 dt='20250101' 分区，且无全表扫描。\n\n## 预估收益\n无明显 SQL 写法优化空间，预估收益为 1x。"
+    },
+    "result_markdown": "## 总结\n该 SQL 为简单的单表分区查询，已正确使用分区过滤，SELECT 仅选取所需字段，存储格式为 ORC，未发现任何 SQL 写法层面的反模式或优化点。\n\n## 问题列表\n### ISSUE-001 未发现明显写法问题\n- **证据**：SQL 为 `select order_id, amount from dwd_order where dt='20250101';`，表 `dwd_order` 为 ORC 分区表，分区字段 `dt` 已用于过滤。\n- **根因**：SQL 写法本身合理，无 JOIN、无聚合、无排序、无子查询等复杂操作。\n- **建议**：当前写法已较优，无需调整。若执行仍慢，建议从数据分布、资源分配或执行计划层面排查。\n- **预估收益**：无\n\n## 需人工核查项\n- 建议人工核查该分区内的数据量及文件数，确认是否存在小文件过多或数据倾斜问题。\n- 可查看执行计划，确认是否仅扫描了 dt='20250101' 分区，且无全表扫描。\n\n## 预估收益\n无明显 SQL 写法优化空间，预估收益为 1x。",
+    "stages": {
+      "node2_retrieval_query": "Hive SQL optimization ; select order_id, amount from dwd_order where dt='20250101';",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "### 问题 SQL",
+        "### 问题 SQL",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 问题 SQL（节选）",
+        "### 问题 SQL（节选）"
+      ],
+      "node4_elapsed_s": 31.5,
+      "node4_usage": {
+        "completion_tokens": 1068,
+        "prompt_tokens": 3531,
+        "total_tokens": 4599,
+        "prompt_tokens_details": {
+          "cached_tokens": 2048
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 497
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"该 SQL 写法简洁，已正确使用分区过滤，未发现明显 SQL 写法层面的问题。\",\n  \"severity\": \"low\",\n  \"estimated_speedup\": \"1x（无明显优化空间）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"sql_anti_pattern\",\n      \"severity\": \"low\",\n      \"title\": \"未发现明显写法问题\",\n      \"evidence\": \"SQL 为单表查询，SELECT 仅指定所需字段，WHE"
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 1,
+    "case_label": "CASE-1 big-small JOIN + select *",
+    "score": {
+      "hit_categories": [
+        "join_strategy",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 2
+    },
+    "result_json": {
+      "summary": "本 SQL 主要问题是对大表使用 SELECT a.* 且与 50MB 小表 JOIN 时未显式使用 MapJoin，可能导致不必要的列读取和 shuffle 开销。",
+      "severity": "high",
+      "estimated_speedup": "2x~5x（保守估计，仅 SQL 写法改动）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "SELECT a.* 导致列裁剪缺失",
+          "evidence": "SQL SELECT 子句为 `select a.* from dwd_order a ...`；dwd_order DDL 字段包含 `order_id string, user_id string, amount decimal(18,2)`，且分区字段为 `dt string`，表容量为 500.0GB。",
+          "root_cause": "`a.*` 会读取 dwd_order 的所有输出列，无法在 SQL 写法层面明确只保留后续真正需要的字段。对于 500GB 大表，列读取范围越大，扫描 IO、反序列化和中间结果传输成本越高。",
+          "recommendation": "建议显式列出最终结果确实需要的 dwd_order 字段，避免使用 `a.*`。如果业务只需要部分字段，应只选择这些字段；JOIN Key 可保留用于关联，但不应额外读取无用列。",
+          "expected_gain": "1.2x~2x（取决于实际需要的列数与 ORC 列裁剪效果）"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "join_strategy",
+          "severity": "high",
+          "title": "大小表 JOIN 未显式使用 MapJoin",
+          "evidence": "SQL 存在 `left join dim_user b on a.user_id=b.uid`；根据 stats，dim_user 容量为 50.0MB，小于 100MB；SQL 中未出现 `/*+ MAPJOIN(...) */` 提示。",
+          "root_cause": "dwd_order 为 500.0GB 大表，dim_user 为 50.0MB 小表。若未显式指定 MapJoin，执行时可能走普通 shuffle join，导致大表按 join key 参与 shuffle，增加网络传输、排序和 reducer 端处理开销。",
+          "recommendation": "建议评估对 dim_user 使用 MapJoin hint，将小表广播到 map 端，与 dwd_order 在 map 侧完成关联，减少大表 shuffle。示意：在 SELECT 后添加针对小表别名 b 的 MAPJOIN hint，但不要改变业务语义。",
+          "expected_gain": "2x~5x（取决于实际执行计划与集群负载）"
+        }
+      ],
+      "needs_human_check": [
+        "当前 SQL 为 `select a.*`，且未输出 dim_user 的字段，也未在 WHERE 中使用 dim_user 字段；建议人工确认该 LEFT JOIN 是否确有业务作用。若 dim_user.uid 不唯一，LEFT JOIN 可能会造成行数扩张；需核查 dim_user.uid 的唯一性。",
+        "建议人工核查关联键 `a.user_id` 与 `b.uid` 的取值分布，确认是否存在大量 NULL、空字符串或热点 key；这里只能作为潜在风险，不能凭当前 SQL 与元数据直接断言。"
+      ],
+      "markdown_report": "## 总结\n本 SQL 已正确使用 dwd_order 的分区字段 `dt` 进行过滤，因此未命中分区裁剪缺失问题。当前明确命中的 SQL 写法问题有 2 个：一是 `select a.*` 导致列裁剪不明确；二是 500GB 大表与 50MB 小表 JOIN 时未显式使用 MapJoin。\n\n## 问题列表\n\n### ISSUE-001 SELECT a.* 导致列裁剪缺失\n- 证据：SQL 使用 `select a.* from dwd_order a ...`；dwd_order 容量为 500.0GB，DDL 字段包含 `order_id string, user_id string, amount decimal(18,2)`，并按 `dt string` 分区。\n- 根因：`a.*` 会读取 dwd_order 的全部输出列，无法明确只保留业务需要字段。对于 500GB 大表，这会增加扫描 IO、反序列化和中间结果传输成本。\n- 建议：显式列出最终结果需要的字段，避免使用 `a.*`。如果业务只需要订单 ID、用户 ID、金额等部分字段，应只保留这些字段。\n- 预估收益：1.2x~2x，取决于实际需要字段数量与 ORC 列裁剪效果。\n\n### ISSUE-002 大小表 JOIN 未显式使用 MapJoin\n- 证据：SQL 存在 `left join dim_user b on a.user_id=b.uid`；dim_user 容量为 50.0MB，小于 100MB；SQL 中未出现 `/*+ MAPJOIN(...) */` 提示。\n- 根因：dwd_order 为 500.0GB 大表，dim_user 为 50.0MB 小表。未显式指定 MapJoin 时，可能走普通 shuffle join，导致大表参与 shuffle，产生较高网络、排序和 reducer 处理开销。\n- 建议：评估对小表 dim_user 使用 MapJoin hint，将其广播到 map 端，减少 dwd_order 的 shuffle 成本。仅建议在 SQL hint 层面处理，不涉及执行参数调整。\n- 预估收益：2x~5x，取决于实际执行计划与集群负载。\n\n## 需人工核查项\n- 当前 SQL 只输出 `a.*`，未使用 b 表字段，也未用 b 表字段过滤；需人工确认该 LEFT JOIN 是否确有业务目的。若 dim_user.uid 不唯一，LEFT JOIN 可能造成行数扩张，建议核查 `dim_user.uid` 唯一性。\n- 建议抽样核查 `a.user_id` 与 `b.uid` 的取值分布，确认是否存在大量 NULL、空字符串或热点 key。该项仅为潜在风险，不能仅凭当前 SQL 与表元数据断言。\n\n## 预估收益\n综合看，优先处理 MapJoin 与 SELECT 列裁剪后，保守估计整体可获得 2x~5x 的 SQL 写法层面收益；实际收益取决于执行计划、输出字段数量和关联键数据分布。"
+    },
+    "result_markdown": "## 总结\n本 SQL 已正确使用 dwd_order 的分区字段 `dt` 进行过滤，因此未命中分区裁剪缺失问题。当前明确命中的 SQL 写法问题有 2 个：一是 `select a.*` 导致列裁剪不明确；二是 500GB 大表与 50MB 小表 JOIN 时未显式使用 MapJoin。\n\n## 问题列表\n\n### ISSUE-001 SELECT a.* 导致列裁剪缺失\n- 证据：SQL 使用 `select a.* from dwd_order a ...`；dwd_order 容量为 500.0GB，DDL 字段包含 `order_id string, user_id string, amount decimal(18,2)`，并按 `dt string` 分区。\n- 根因：`a.*` 会读取 dwd_order 的全部输出列，无法明确只保留业务需要字段。对于 500GB 大表，这会增加扫描 IO、反序列化和中间结果传输成本。\n- 建议：显式列出最终结果需要的字段，避免使用 `a.*`。如果业务只需要订单 ID、用户 ID、金额等部分字段，应只保留这些字段。\n- 预估收益：1.2x~2x，取决于实际需要字段数量与 ORC 列裁剪效果。\n\n### ISSUE-002 大小表 JOIN 未显式使用 MapJoin\n- 证据：SQL 存在 `left join dim_user b on a.user_id=b.uid`；dim_user 容量为 50.0MB，小于 100MB；SQL 中未出现 `/*+ MAPJOIN(...) */` 提示。\n- 根因：dwd_order 为 500.0GB 大表，dim_user 为 50.0MB 小表。未显式指定 MapJoin 时，可能走普通 shuffle join，导致大表参与 shuffle，产生较高网络、排序和 reducer 处理开销。\n- 建议：评估对小表 dim_user 使用 MapJoin hint，将其广播到 map 端，减少 dwd_order 的 shuffle 成本。仅建议在 SQL hint 层面处理，不涉及执行参数调整。\n- 预估收益：2x~5x，取决于实际执行计划与集群负载。\n\n## 需人工核查项\n- 当前 SQL 只输出 `a.*`，未使用 b 表字段，也未用 b 表字段过滤；需人工确认该 LEFT JOIN 是否确有业务目的。若 dim_user.uid 不唯一，LEFT JOIN 可能造成行数扩张，建议核查 `dim_user.uid` 唯一性。\n- 建议抽样核查 `a.user_id` 与 `b.uid` 的取值分布，确认是否存在大量 NULL、空字符串或热点 key。该项仅为潜在风险，不能仅凭当前 SQL 与表元数据断言。\n\n## 预估收益\n综合看，优先处理 MapJoin 与 SELECT 列裁剪后，保守估计整体可获得 2x~5x 的 SQL 写法层面收益；实际收益取决于执行计划、输出字段数量和关联键数据分布。",
+    "stages": {
+      "node2_retrieval_query": "select 星号 ; select star column pruning ; 小表 JOIN MapJoin ; MapJoin broadcast small table",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-020] 大小表 JOIN 未走 MapJoin",
+        "## 知识卡索引",
+        "## [KB-034] 嵌套子查询 / 老式逗号 JOIN",
+        "## [CASE-002] 多表 LEFT JOIN 中间结果膨胀",
+        "### 建议方向",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 20.5,
+      "node4_usage": {
+        "completion_tokens": 1912,
+        "prompt_tokens": 3848,
+        "total_tokens": 5760,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 512
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"本 SQL 主要问题是对大表使用 SELECT a.* 且与 50MB 小表 JOIN 时未显式使用 MapJoin，可能导致不必要的列读取和 shuffle 开销。\",\"severity\":\"high\",\"estimated_speedup\":\"2x~5x（保守估计，仅 SQL 写法改动）\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"medium\",\"title\":\"SELECT a.* 导致列裁剪缺失\",\"evidence\":\"SQL SELECT 子句为 `selec"
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 2,
+    "case_label": "CASE-2 missing partition filter",
+    "score": {
+      "hit_categories": [
+        "partition_pruning"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "最关键问题是 dwd_order 为 500GB 分区表，但 SQL 仅按普通字段 create_time 过滤，未使用分区字段 dt，存在分区裁剪缺失导致大范围扫描的风险。",
+      "severity": "high",
+      "estimated_speedup": "3x~10x（取决于实际命中的分区范围）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "high",
+          "title": "分区表未使用分区字段过滤",
+          "evidence": "dwd_order DDL 含 `PARTITIONED BY (dt string)`，表容量 500.0GB；SQL 为 `select order_id, amount from dwd_order where create_time >= '2024-01-01'`，WHERE 中仅使用普通字段 `create_time`，没有 `dt` 分区字段过滤条件。",
+          "root_cause": "Hive 依赖分区字段条件进行分区裁剪。当前 SQL 虽然按 `create_time` 过滤，但 `create_time` 不是 DDL 中声明的分区字段，无法直接裁剪 `dt` 分区，容易扫描大量无关分区。",
+          "recommendation": "建议在保证业务语义一致的前提下，补充分区字段 `dt` 的过滤条件，使查询能够先按分区裁剪，再在分区内按 `create_time` 做明细过滤。不要仅依赖普通时间字段过滤大分区表。",
+          "expected_gain": "3x~10x（取决于 dt 分区数量和实际时间范围）"
+        }
+      ],
+      "needs_human_check": [
+        "请人工确认 `create_time` 与分区字段 `dt` 的业务关系，判断是否可以安全补充 `dt` 范围过滤条件。",
+        "请人工核查该任务实际需要扫描的日期范围，避免误加过窄或过宽的分区条件。"
+      ],
+      "markdown_report": "## 总结\n该 SQL 当前只命中 1 个明确的 SQL 写法问题：`dwd_order` 是 500GB 的 `dt` 分区表，但查询条件没有使用分区字段 `dt`，只使用了普通字段 `create_time`，会导致分区裁剪缺失。\n\n## 问题列表\n\n### ISSUE-001 分区表未使用分区字段过滤\n- 证据：`dwd_order` DDL 中存在 `PARTITIONED BY (dt string)`，表容量为 500.0GB；SQL 片段为 `where create_time >= '2024-01-01'`，未出现 `dt` 过滤条件。\n- 根因：Hive 分区裁剪依赖分区字段条件。`create_time` 虽然是时间字段，但它不是分区字段，不能替代 `dt` 进行分区裁剪。\n- 建议：在业务语义允许的前提下，补充 `dt` 分区范围过滤，并保留 `create_time` 明细过滤，减少需要扫描的分区数量。\n- 预估收益：3x~10x，取决于实际分区数量和查询日期范围。\n\n## 需人工核查项\n- 请确认 `create_time` 与 `dt` 的对应关系，判断是否能安全增加 `dt` 分区条件。\n- 请确认该任务实际业务所需日期范围，避免分区条件设置错误。\n\n## 预估收益\n仅从 SQL 写法层面看，补充分区裁剪是最主要优化点。若当前扫描了大量无关 `dt` 分区，收益可能较明显；保守估计为 3x~10x。"
+    },
+    "result_markdown": "## 总结\n该 SQL 当前只命中 1 个明确的 SQL 写法问题：`dwd_order` 是 500GB 的 `dt` 分区表，但查询条件没有使用分区字段 `dt`，只使用了普通字段 `create_time`，会导致分区裁剪缺失。\n\n## 问题列表\n\n### ISSUE-001 分区表未使用分区字段过滤\n- 证据：`dwd_order` DDL 中存在 `PARTITIONED BY (dt string)`，表容量为 500.0GB；SQL 片段为 `where create_time >= '2024-01-01'`，未出现 `dt` 过滤条件。\n- 根因：Hive 分区裁剪依赖分区字段条件。`create_time` 虽然是时间字段，但它不是分区字段，不能替代 `dt` 进行分区裁剪。\n- 建议：在业务语义允许的前提下，补充 `dt` 分区范围过滤，并保留 `create_time` 明细过滤，减少需要扫描的分区数量。\n- 预估收益：3x~10x，取决于实际分区数量和查询日期范围。\n\n## 需人工核查项\n- 请确认 `create_time` 与 `dt` 的对应关系，判断是否能安全增加 `dt` 分区条件。\n- 请确认该任务实际业务所需日期范围，避免分区条件设置错误。\n\n## 预估收益\n仅从 SQL 写法层面看，补充分区裁剪是最主要优化点。若当前扫描了大量无关 `dt` 分区，收益可能较明显；保守估计为 3x~10x。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-011] 分区裁剪缺失",
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-004] 动态分区写入长尾",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [KB-010] 列裁剪缺失（SELECT *）",
+        "## 知识卡索引"
+      ],
+      "node4_elapsed_s": 14.4,
+      "node4_usage": {
+        "completion_tokens": 1200,
+        "prompt_tokens": 3569,
+        "total_tokens": 4769,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 401
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"最关键问题是 dwd_order 为 500GB 分区表，但 SQL 仅按普通字段 create_time 过滤，未使用分区字段 dt，存在分区裁剪缺失导致大范围扫描的风险。\",\"severity\":\"high\",\"estimated_speedup\":\"3x~10x（取决于实际命中的分区范围）\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"partition_pruning\",\"severity\":\"high\",\"title\":\"分区表未使用分区字段过滤\",\"evidence\":\"dwd_order DDL 含 `PARTITION"
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 3,
+    "case_label": "CASE-3 multi count(distinct)",
+    "score": {
+      "hit_categories": [
+        "aggregation"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "该 SQL 已命中分区裁剪，但在 100GB 大表上同一 SELECT 中执行 2 个 count(distinct)，容易形成聚合阶段瓶颈。",
+      "severity": "high",
+      "estimated_speedup": "2x~5x（保守估计，仅 SQL 写法改动，取决于实际基数）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "aggregation",
+          "severity": "high",
+          "title": "大表上存在多个 count(distinct) 聚合",
+          "evidence": "SQL SELECT 子句包含 `count(distinct user_id)` 和 `count(distinct order_id)` 共 2 个 distinct；表 dwd_order 的 stats 显示容量为 100.0GB、行数为 100000000。",
+          "root_cause": "Hive on MR/Tez 中 count(distinct) 通常会带来较重的去重聚合开销；同一 SELECT 中对不同字段执行多个 distinct，会增加聚合阶段的数据交换和状态维护成本，在 100GB 大表上更容易成为长耗时环节。",
+          "recommendation": "建议评估是否必须在同一聚合阶段同时计算两个精确 distinct。若业务允许，可将不同 distinct 指标拆成独立聚合逻辑后再合并结果，或采用分阶段预聚合思路降低单阶段去重压力；如果允许近似口径，也可评估近似去重函数替代精确 count(distinct)。不要改变当前 `dt='20250101'` 分区过滤条件。",
+          "expected_gain": "2x~5x（取决于 user_id、order_id 的实际基数与分布）"
+        }
+      ],
+      "needs_human_check": [
+        "建议人工核查 dwd_order 在 dt='20250101' 分区内 user_id、order_id 的去重基数，判断 distinct 聚合压力大小。",
+        "潜在风险：建议人工核查 user_id、order_id 是否存在大量 NULL 或空字符串；当前仅为数据分布风险提示，不能从 SQL/DDL/stats 直接断言。"
+      ],
+      "markdown_report": "## 总结\n该 SQL 对 dwd_order 使用了分区字段 `dt='20250101'`，分区裁剪写法本身没有明显问题；主要风险是对 100GB 大表在同一 SELECT 中计算 2 个 `count(distinct ...)` 指标，可能导致聚合阶段耗时较长。\n\n## 问题列表\n### ISSUE-001：大表上存在多个 count(distinct) 聚合\n- 证据：SQL 中出现 `count(distinct user_id)` 与 `count(distinct order_id)`；表 dwd_order 容量为 100.0GB，行数为 100000000。\n- 根因：多个不同字段的精确 distinct 会增加去重聚合阶段的计算、内存状态和数据交换压力，在大表上容易成为慢 SQL 的核心瓶颈。\n- 建议：评估是否必须在同一 SELECT 中同时计算两个精确 distinct；可考虑将不同 distinct 指标拆成独立聚合逻辑后再合并，或使用分阶段预聚合降低单阶段去重压力；若业务允许，可评估近似去重口径。\n- 预估收益：2x~5x，取决于实际去重基数与数据分布。\n\n## 需人工核查项\n- 核查 dwd_order 在 `dt='20250101'` 分区内 user_id、order_id 的去重基数。\n- 潜在风险：核查 user_id、order_id 是否存在大量 NULL 或空字符串；该项不能从当前 SQL/DDL/stats 直接确认。\n\n## 预估收益\n整体保守估计 2x~5x，仅基于 SQL 写法层面的 distinct 聚合优化；实际收益取决于分区数据量、字段基数和分布。"
+    },
+    "result_markdown": "## 总结\n该 SQL 对 dwd_order 使用了分区字段 `dt='20250101'`，分区裁剪写法本身没有明显问题；主要风险是对 100GB 大表在同一 SELECT 中计算 2 个 `count(distinct ...)` 指标，可能导致聚合阶段耗时较长。\n\n## 问题列表\n### ISSUE-001：大表上存在多个 count(distinct) 聚合\n- 证据：SQL 中出现 `count(distinct user_id)` 与 `count(distinct order_id)`；表 dwd_order 容量为 100.0GB，行数为 100000000。\n- 根因：多个不同字段的精确 distinct 会增加去重聚合阶段的计算、内存状态和数据交换压力，在大表上容易成为慢 SQL 的核心瓶颈。\n- 建议：评估是否必须在同一 SELECT 中同时计算两个精确 distinct；可考虑将不同 distinct 指标拆成独立聚合逻辑后再合并，或使用分阶段预聚合降低单阶段去重压力；若业务允许，可评估近似去重口径。\n- 预估收益：2x~5x，取决于实际去重基数与数据分布。\n\n## 需人工核查项\n- 核查 dwd_order 在 `dt='20250101'` 分区内 user_id、order_id 的去重基数。\n- 潜在风险：核查 user_id、order_id 是否存在大量 NULL 或空字符串；该项不能从当前 SQL/DDL/stats 直接确认。\n\n## 预估收益\n整体保守估计 2x~5x，仅基于 SQL 写法层面的 distinct 聚合优化；实际收益取决于分区数据量、字段基数和分布。",
+    "stages": {
+      "node2_retrieval_query": "count distinct 多字段 ; count distinct skew",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-031] COUNT(DISTINCT) 单 Reducer",
+        "## 知识卡索引",
+        "### 问题诊断",
+        "## 真实案例索引",
+        "## [KB-002] DISTINCT 单点瓶颈"
+      ],
+      "node4_elapsed_s": 17.2,
+      "node4_usage": {
+        "completion_tokens": 1341,
+        "prompt_tokens": 3839,
+        "total_tokens": 5180,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 432
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"该 SQL 已命中分区裁剪，但在 100GB 大表上同一 SELECT 中执行 2 个 count(distinct)，容易形成聚合阶段瓶颈。\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"2x~5x（保守估计，仅 SQL 写法改动，取决于实际基数）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"aggregation\",\n      \"severity\": \"high\",\n      \"title\": \"大表上存在多个 cou"
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 4,
+    "case_label": "CASE-4 ORDER BY no LIMIT + select *",
+    "score": {
+      "hit_categories": [
+        "partition_pruning",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 3
+    },
+    "result_json": {
+      "summary": "该 SQL 在 500GB 分区大表上未做 dt 分区过滤，同时使用 SELECT * 并执行无 LIMIT 的全局 ORDER BY，是最主要的慢任务风险。",
+      "severity": "critical",
+      "estimated_speedup": "5x~50x（取决于实际分区范围和是否确需全量全局排序）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "critical",
+          "title": "分区表缺失分区过滤，可能扫描全量历史分区",
+          "evidence": "dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL 为 `select * from dwd_order order by create_time desc;`，未出现 WHERE 条件，也没有对分区字段 `dt` 的过滤。",
+          "root_cause": "Hive 分区裁剪依赖分区字段过滤条件；该表容量为 500.0GB、行数为 5000000000，缺少 `dt` 过滤会导致读取范围扩大到所有相关分区。",
+          "recommendation": "建议根据业务查询范围补充分区字段 `dt` 的过滤条件，只读取必要日期或分区范围；不要仅依赖普通字段如 `create_time` 代替分区字段过滤。",
+          "expected_gain": "3x~30x（取决于实际需要读取的分区数量）"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "使用 SELECT *，无法有效减少读取列",
+          "evidence": "SQL SELECT 子句为 `select *`；dwd_order DDL 字段包含 `order_id string, create_time string`，并且表为 `STORED AS ORC` 的列存表。",
+          "root_cause": "列存表在只选择必要字段时可进行列裁剪；`SELECT *` 会读取所有输出列，增加 IO、反序列化和后续排序阶段的数据量。",
+          "recommendation": "建议只保留业务实际需要的列，避免使用 `SELECT *`；尤其在后续存在排序等重操作时，应尽量减少进入排序阶段的数据宽度。",
+          "expected_gain": "1.1x~2x（取决于实际需要列数和列宽）"
+        },
+        {
+          "id": "ISSUE-003",
+          "category": "sql_anti_pattern",
+          "severity": "high",
+          "title": "ORDER BY 无 LIMIT 导致全局排序",
+          "evidence": "SQL 末尾存在 `order by create_time desc`，未出现 `limit`；dwd_order 容量为 500.0GB、行数为 5000000000。",
+          "root_cause": "Hive 中 `ORDER BY` 表示全局排序，通常会将全量结果集中到单一全局排序阶段处理；在 500GB 大表上且没有 LIMIT，会产生非常重的排序开销。",
+          "recommendation": "如果业务只需要 Top N，建议增加结果条数限制；如果不要求全局有序，只需要分区内或局部有序，应考虑改用更符合业务语义的排序方式。避免对 500GB 全量结果做无界全局排序。",
+          "expected_gain": "3x~20x（取决于是否可以限制结果量或取消全局排序）"
+        }
+      ],
+      "needs_human_check": [
+        "请确认业务是否确实需要查询 dwd_order 的全历史分区；如只需某些日期范围，应明确对应的 dt 分区范围。",
+        "请确认业务是否确实需要返回全部列；如只需要 order_id、create_time 等少量字段，应减少输出列。",
+        "请确认业务是否确实需要对 500GB 全量结果按 create_time 做全局降序排序；如只需要 Top N 或局部排序，应明确结果范围。"
+      ],
+      "markdown_report": "## 总结\n该 SQL 命中 3 个明确的 SQL 写法问题：分区表缺少 dt 分区过滤、使用 SELECT *、以及在 500GB 大表上执行无 LIMIT 的全局 ORDER BY。其中影响最大的通常是缺失分区裁剪和全量全局排序。\n\n## 问题列表\n\n### ISSUE-001 分区表缺失分区过滤，可能扫描全量历史分区\n- 证据：dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL 为 `select * from dwd_order order by create_time desc;`，未出现 WHERE 条件，也没有对分区字段 `dt` 的过滤。\n- 根因：Hive 分区裁剪依赖分区字段过滤条件；该表容量为 500.0GB、行数为 5000000000，缺少 `dt` 过滤会导致读取范围扩大到所有相关分区。\n- 建议：根据业务查询范围补充分区字段 `dt` 的过滤条件，只读取必要日期或分区范围；不要仅依赖普通字段如 `create_time` 代替分区字段过滤。\n- 预估收益：3x~30x，取决于实际需要读取的分区数量。\n\n### ISSUE-002 使用 SELECT *，无法有效减少读取列\n- 证据：SQL SELECT 子句为 `select *`；dwd_order DDL 字段包含 `order_id string, create_time string`，并且表为 `STORED AS ORC` 的列存表。\n- 根因：列存表在只选择必要字段时可进行列裁剪；`SELECT *` 会读取所有输出列，增加 IO、反序列化和后续排序阶段的数据量。\n- 建议：只保留业务实际需要的列，避免使用 `SELECT *`；尤其在后续存在排序等重操作时，应尽量减少进入排序阶段的数据宽度。\n- 预估收益：1.1x~2x，取决于实际需要列数和列宽。\n\n### ISSUE-003 ORDER BY 无 LIMIT 导致全局排序\n- 证据：SQL 末尾存在 `order by create_time desc`，未出现 `limit`；dwd_order 容量为 500.0GB、行数为 5000000000。\n- 根因：Hive 中 `ORDER BY` 表示全局排序，通常会将全量结果集中到单一全局排序阶段处理；在 500GB 大表上且没有 LIMIT，会产生非常重的排序开销。\n- 建议：如果业务只需要 Top N，建议增加结果条数限制；如果不要求全局有序，只需要分区内或局部有序，应考虑改用更符合业务语义的排序方式。避免对 500GB 全量结果做无界全局排序。\n- 预估收益：3x~20x，取决于是否可以限制结果量或取消全局排序。\n\n## 需人工核查项\n- 请确认业务是否确实需要查询 dwd_order 的全历史分区；如只需某些日期范围，应明确对应的 dt 分区范围。\n- 请确认业务是否确实需要返回全部列；如只需要 order_id、create_time 等少量字段，应减少输出列。\n- 请确认业务是否确实需要对 500GB 全量结果按 create_time 做全局降序排序；如只需要 Top N 或局部排序，应明确结果范围。\n\n## 预估收益\n综合看，若可以同时补充分区过滤、减少输出列，并避免无界全局排序，保守预估 SQL 写法层面的整体收益约为 5x~50x；实际收益取决于最终读取的分区数量、输出列数量以及排序结果范围。"
+    },
+    "result_markdown": "## 总结\n该 SQL 命中 3 个明确的 SQL 写法问题：分区表缺少 dt 分区过滤、使用 SELECT *、以及在 500GB 大表上执行无 LIMIT 的全局 ORDER BY。其中影响最大的通常是缺失分区裁剪和全量全局排序。\n\n## 问题列表\n\n### ISSUE-001 分区表缺失分区过滤，可能扫描全量历史分区\n- 证据：dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL 为 `select * from dwd_order order by create_time desc;`，未出现 WHERE 条件，也没有对分区字段 `dt` 的过滤。\n- 根因：Hive 分区裁剪依赖分区字段过滤条件；该表容量为 500.0GB、行数为 5000000000，缺少 `dt` 过滤会导致读取范围扩大到所有相关分区。\n- 建议：根据业务查询范围补充分区字段 `dt` 的过滤条件，只读取必要日期或分区范围；不要仅依赖普通字段如 `create_time` 代替分区字段过滤。\n- 预估收益：3x~30x，取决于实际需要读取的分区数量。\n\n### ISSUE-002 使用 SELECT *，无法有效减少读取列\n- 证据：SQL SELECT 子句为 `select *`；dwd_order DDL 字段包含 `order_id string, create_time string`，并且表为 `STORED AS ORC` 的列存表。\n- 根因：列存表在只选择必要字段时可进行列裁剪；`SELECT *` 会读取所有输出列，增加 IO、反序列化和后续排序阶段的数据量。\n- 建议：只保留业务实际需要的列，避免使用 `SELECT *`；尤其在后续存在排序等重操作时，应尽量减少进入排序阶段的数据宽度。\n- 预估收益：1.1x~2x，取决于实际需要列数和列宽。\n\n### ISSUE-003 ORDER BY 无 LIMIT 导致全局排序\n- 证据：SQL 末尾存在 `order by create_time desc`，未出现 `limit`；dwd_order 容量为 500.0GB、行数为 5000000000。\n- 根因：Hive 中 `ORDER BY` 表示全局排序，通常会将全量结果集中到单一全局排序阶段处理；在 500GB 大表上且没有 LIMIT，会产生非常重的排序开销。\n- 建议：如果业务只需要 Top N，建议增加结果条数限制；如果不要求全局有序，只需要分区内或局部有序，应考虑改用更符合业务语义的排序方式。避免对 500GB 全量结果做无界全局排序。\n- 预估收益：3x~20x，取决于是否可以限制结果量或取消全局排序。\n\n## 需人工核查项\n- 请确认业务是否确实需要查询 dwd_order 的全历史分区；如只需某些日期范围，应明确对应的 dt 分区范围。\n- 请确认业务是否确实需要返回全部列；如只需要 order_id、create_time 等少量字段，应减少输出列。\n- 请确认业务是否确实需要对 500GB 全量结果按 create_time 做全局降序排序；如只需要 Top N 或局部排序，应明确结果范围。\n\n## 预估收益\n综合看，若可以同时补充分区过滤、减少输出列，并避免无界全局排序，保守预估 SQL 写法层面的整体收益约为 5x~50x；实际收益取决于最终读取的分区数量、输出列数量以及排序结果范围。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning ; select 星号 ; select star column pruning ; order by 全局排序 无 limit ; order by no limit global sort",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-050] 全局 ORDER BY 无 LIMIT",
+        "## [CASE-001] 大表 ORDER BY 全局排序",
+        "## 知识卡索引",
+        "### 排序语法对比",
+        "### 问题诊断",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 21.5,
+      "node4_usage": {
+        "completion_tokens": 2240,
+        "prompt_tokens": 3801,
+        "total_tokens": 6041,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 477
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"该 SQL 在 500GB 分区大表上未做 dt 分区过滤，同时使用 SELECT * 并执行无 LIMIT 的全局 ORDER BY，是最主要的慢任务风险。\",\n  \"severity\": \"critical\",\n  \"estimated_speedup\": \"5x~50x（取决于实际分区范围和是否确需全量全局排序）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"partition_pruning\",\n      \"severity\": \"critical\",\n      \""
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 5,
+    "case_label": "CASE-5 same table scanned 3 times",
+    "score": {
+      "hit_categories": [
+        "subquery"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "最关键的问题是 50GB 的 FCT_ACTIVITY 被 3 个相似子查询重复扫描，造成不必要的大表扫描与多次 JOIN 成本。",
+      "severity": "high",
+      "estimated_speedup": "2x~4x（保守估计，仅 SQL 写法改动）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "subquery",
+          "severity": "high",
+          "title": "同一大表 FCT_ACTIVITY 被 3 个相似子查询重复扫描",
+          "evidence": "SQL 中 3 个 LEFT JOIN 子查询均扫描 FCT_ACTIVITY：`select process_id from FCT_ACTIVITY where link_define_nm='answer-plan'`、`select process_id from FCT_ACTIVITY where link_define_nm='intake'`、`select process_id from FCT_ACTIVITY where link_define_nm='design-doc'`；表 stats 显示 FCT_ACTIVITY 容量 50.0GB、行数 50000000。",
+          "root_cause": "每个子查询都需要独立读取并过滤 FCT_ACTIVITY，同一张 50GB 大表被扫描 3 次；同时每个子查询再分别与 fact_order 做 LEFT JOIN，增加扫描、shuffle 和 JOIN 计算成本。知识库 KB-033 指出同表多次扫描应考虑用条件聚合或 CASE WHEN 思路合并，避免重复扫描。",
+          "recommendation": "建议将针对 FCT_ACTIVITY 的多个相似过滤逻辑合并为一次扫描，再基于 link_define_nm 做条件标记或条件聚合，最后与 fact_order 关联；避免对同一大表按不同常量条件拆成多个独立子查询。不要改变业务语义，需确认合并后每个 process_id 的匹配关系与当前 3 次 LEFT JOIN 结果一致。",
+          "expected_gain": "2x~4x（取决于 FCT_ACTIVITY 扫描成本、过滤选择性和 JOIN 后中间结果规模）"
+        }
+      ],
+      "needs_human_check": [
+        "建议人工核查 FCT_ACTIVITY 中 link_define_nm='answer-plan'、'intake'、'design-doc' 三类过滤后的行数，确认合并扫描后的收益空间。",
+        "建议人工核查 FCT_ACTIVITY.process_id 对上述三个 link_define_nm 取值是否存在一对多匹配；如果存在，同一 fact_order.process_id 可能在 LEFT JOIN 后产生多行扩张，需确认是否符合业务预期。",
+        "建议人工核查 fact_order.process_id 与 FCT_ACTIVITY.process_id 的关联键分布是否存在大量 NULL、空字符串或少数 key 过度集中；这是潜在风险，不能仅凭当前 SQL 与 DDL 断定。"
+      ],
+      "markdown_report": "## 总结\n当前 SQL 明确命中同表重复扫描问题：FCT_ACTIVITY 为 50.0GB、50000000 行的大表，但 SQL 中通过 3 个相似 LEFT JOIN 子查询分别扫描该表，仅过滤条件 link_define_nm 不同。这会造成 3 次大表读取和 3 次 JOIN，属于典型 SQL 写法层面的低效模式。\n\n## 问题列表\n\n### ISSUE-001 同一大表 FCT_ACTIVITY 被 3 个相似子查询重复扫描\n\n证据：SQL 中 3 个 LEFT JOIN 子查询均扫描 FCT_ACTIVITY：`select process_id from FCT_ACTIVITY where link_define_nm='answer-plan'`、`select process_id from FCT_ACTIVITY where link_define_nm='intake'`、`select process_id from FCT_ACTIVITY where link_define_nm='design-doc'`；表 stats 显示 FCT_ACTIVITY 容量 50.0GB、行数 50000000。\n\n根因：每个子查询都需要独立读取并过滤 FCT_ACTIVITY，同一张 50GB 大表被扫描 3 次；同时每个子查询再分别与 fact_order 做 LEFT JOIN，增加扫描、shuffle 和 JOIN 计算成本。知识库 KB-033 指出同表多次扫描应考虑用条件聚合或 CASE WHEN 思路合并，避免重复扫描。\n\n建议：建议将针对 FCT_ACTIVITY 的多个相似过滤逻辑合并为一次扫描，再基于 link_define_nm 做条件标记或条件聚合，最后与 fact_order 关联；避免对同一大表按不同常量条件拆成多个独立子查询。不要改变业务语义，需确认合并后每个 process_id 的匹配关系与当前 3 次 LEFT JOIN 结果一致。\n\n预估收益：2x~4x，取决于 FCT_ACTIVITY 扫描成本、过滤选择性和 JOIN 后中间结果规模。\n\n## 需人工核查项\n- 建议人工核查 FCT_ACTIVITY 中 link_define_nm='answer-plan'、'intake'、'design-doc' 三类过滤后的行数，确认合并扫描后的收益空间。\n- 建议人工核查 FCT_ACTIVITY.process_id 对上述三个 link_define_nm 取值是否存在一对多匹配；如果存在，同一 fact_order.process_id 可能在 LEFT JOIN 后产生多行扩张，需确认是否符合业务预期。\n- 建议人工核查 fact_order.process_id 与 FCT_ACTIVITY.process_id 的关联键分布是否存在大量 NULL、空字符串或少数 key 过度集中；这是潜在风险，不能仅凭当前 SQL 与 DDL 断定。\n\n## 预估收益\n整体保守估计 2x~4x。主要收益来自减少 FCT_ACTIVITY 的重复全表扫描次数，以及减少由 3 次独立 LEFT JOIN 带来的额外计算与中间结果开销。"
+    },
+    "result_markdown": "## 总结\n当前 SQL 明确命中同表重复扫描问题：FCT_ACTIVITY 为 50.0GB、50000000 行的大表，但 SQL 中通过 3 个相似 LEFT JOIN 子查询分别扫描该表，仅过滤条件 link_define_nm 不同。这会造成 3 次大表读取和 3 次 JOIN，属于典型 SQL 写法层面的低效模式。\n\n## 问题列表\n\n### ISSUE-001 同一大表 FCT_ACTIVITY 被 3 个相似子查询重复扫描\n\n证据：SQL 中 3 个 LEFT JOIN 子查询均扫描 FCT_ACTIVITY：`select process_id from FCT_ACTIVITY where link_define_nm='answer-plan'`、`select process_id from FCT_ACTIVITY where link_define_nm='intake'`、`select process_id from FCT_ACTIVITY where link_define_nm='design-doc'`；表 stats 显示 FCT_ACTIVITY 容量 50.0GB、行数 50000000。\n\n根因：每个子查询都需要独立读取并过滤 FCT_ACTIVITY，同一张 50GB 大表被扫描 3 次；同时每个子查询再分别与 fact_order 做 LEFT JOIN，增加扫描、shuffle 和 JOIN 计算成本。知识库 KB-033 指出同表多次扫描应考虑用条件聚合或 CASE WHEN 思路合并，避免重复扫描。\n\n建议：建议将针对 FCT_ACTIVITY 的多个相似过滤逻辑合并为一次扫描，再基于 link_define_nm 做条件标记或条件聚合，最后与 fact_order 关联；避免对同一大表按不同常量条件拆成多个独立子查询。不要改变业务语义，需确认合并后每个 process_id 的匹配关系与当前 3 次 LEFT JOIN 结果一致。\n\n预估收益：2x~4x，取决于 FCT_ACTIVITY 扫描成本、过滤选择性和 JOIN 后中间结果规模。\n\n## 需人工核查项\n- 建议人工核查 FCT_ACTIVITY 中 link_define_nm='answer-plan'、'intake'、'design-doc' 三类过滤后的行数，确认合并扫描后的收益空间。\n- 建议人工核查 FCT_ACTIVITY.process_id 对上述三个 link_define_nm 取值是否存在一对多匹配；如果存在，同一 fact_order.process_id 可能在 LEFT JOIN 后产生多行扩张，需确认是否符合业务预期。\n- 建议人工核查 fact_order.process_id 与 FCT_ACTIVITY.process_id 的关联键分布是否存在大量 NULL、空字符串或少数 key 过度集中；这是潜在风险，不能仅凭当前 SQL 与 DDL 断定。\n\n## 预估收益\n整体保守估计 2x~4x。主要收益来自减少 FCT_ACTIVITY 的重复全表扫描次数，以及减少由 3 次独立 LEFT JOIN 带来的额外计算与中间结果开销。",
+    "stages": {
+      "node2_retrieval_query": "同表重复扫描 ; repeated table scan grouping sets",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [CASE-004] 同表重复扫描",
+        "## [KB-033] 同表多次扫描应 CASE WHEN 合并",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [CASE-010] OR 逻辑错误导致全表扫描",
+        "## 真实案例索引",
+        "### 根因"
+      ],
+      "node4_elapsed_s": 17.9,
+      "node4_usage": {
+        "completion_tokens": 1741,
+        "prompt_tokens": 3656,
+        "total_tokens": 5397,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 512
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"最关键的问题是 50GB 的 FCT_ACTIVITY 被 3 个相似子查询重复扫描，造成不必要的大表扫描与多次 JOIN 成本。\",\"severity\":\"high\",\"estimated_speedup\":\"2x~4x（保守估计，仅 SQL 写法改动）\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"subquery\",\"severity\":\"high\",\"title\":\"同一大表 FCT_ACTIVITY 被 3 个相似子查询重复扫描\",\"evidence\":\"SQL 中 3 个 LEFT JOIN 子查询均扫描 FCT_ACTI"
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 6,
+    "case_label": "CASE-6 UNION should be UNION ALL",
+    "score": {
+      "hit_categories": [
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 明确命中 UNION 隐式去重问题，`union` 会触发全局去重 Shuffle，若业务不需要去重可改为 UNION ALL 降低开销。",
+      "severity": "low",
+      "estimated_speedup": "1.2x~2x（取决于两个分区 uid 重复比例与去重规模）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "UNION 触发隐式全局去重",
+          "evidence": "SQL 片段：`select uid from dwd_user_active where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，使用的是 `union`，不是 `union all`；表 dwd_user_active 容量 10.0GB、行数 10000000。",
+          "root_cause": "`UNION` 在 Hive 中语义等价于合并后再做全局 DISTINCT，会额外引入去重计算与 Shuffle；如果业务只是合并两个分区结果且不要求去重，这部分开销是多余的。",
+          "recommendation": "建议先与业务确认两个日期分区的 uid 合并结果是否必须去重；若允许重复或天然不重复，使用 UNION ALL；若确实需要去重，可考虑先 UNION ALL 后再按全部输出列做统一去重，以便更清晰地控制去重逻辑。",
+          "expected_gain": "1.2x~2x（取决于实际去重数据量）"
+        }
+      ],
+      "needs_human_check": [
+        "请业务确认 20250101 与 20250102 两个分区的 uid 合并后是否必须去重；如果下游不依赖去重语义，当前 UNION 的全局去重可以避免。"
+      ],
+      "markdown_report": "## 总结\n当前 SQL 主要问题是使用了 `UNION` 而不是 `UNION ALL`。`dwd_user_active` 是 ORC 分区表，SQL 已对分区字段 `dt` 做过滤，因此未命中分区裁剪缺失问题；也未发现 JOIN、ORDER BY、SELECT *、窗口函数、IN 子查询等其他明显写法问题。\n\n## 问题列表\n\n### ISSUE-001：UNION 触发隐式全局去重\n- 证据：SQL 中存在 `where dt='20250101' union select uid ... where dt='20250102'`，使用的是 `union`，不是 `union all`；表 `dwd_user_active` 容量 10.0GB、行数 10000000。\n- 根因：`UNION` 会对合并后的结果做全局去重，通常会引入额外 Shuffle 与 DISTINCT 计算。若业务只是合并两个分区的 uid，且不要求去重，则该成本属于不必要开销。\n- 建议：与业务确认是否必须去重。若允许重复或已保证无重复，建议使用 UNION ALL；若确实需要去重，可考虑先合并再统一去重，避免隐式去重语义不清。\n- 预估收益：1.2x~2x，取决于两个分区 uid 的重复比例与去重规模。\n\n## 需人工核查项\n- 请确认两个日期分区的 uid 合并后是否必须去重；该判断属于业务语义，不能仅凭 SQL 与 DDL 判断。\n\n## 预估收益\n仅从 SQL 写法看，保守预计优化收益为 1.2x~2x。若两个分区结果量较大且去重成本较高，收益可能更明显；若结果量较小或确实需要全局去重，收益有限。"
+    },
+    "result_markdown": "## 总结\n当前 SQL 主要问题是使用了 `UNION` 而不是 `UNION ALL`。`dwd_user_active` 是 ORC 分区表，SQL 已对分区字段 `dt` 做过滤，因此未命中分区裁剪缺失问题；也未发现 JOIN、ORDER BY、SELECT *、窗口函数、IN 子查询等其他明显写法问题。\n\n## 问题列表\n\n### ISSUE-001：UNION 触发隐式全局去重\n- 证据：SQL 中存在 `where dt='20250101' union select uid ... where dt='20250102'`，使用的是 `union`，不是 `union all`；表 `dwd_user_active` 容量 10.0GB、行数 10000000。\n- 根因：`UNION` 会对合并后的结果做全局去重，通常会引入额外 Shuffle 与 DISTINCT 计算。若业务只是合并两个分区的 uid，且不要求去重，则该成本属于不必要开销。\n- 建议：与业务确认是否必须去重。若允许重复或已保证无重复，建议使用 UNION ALL；若确实需要去重，可考虑先合并再统一去重，避免隐式去重语义不清。\n- 预估收益：1.2x~2x，取决于两个分区 uid 的重复比例与去重规模。\n\n## 需人工核查项\n- 请确认两个日期分区的 uid 合并后是否必须去重；该判断属于业务语义，不能仅凭 SQL 与 DDL 判断。\n\n## 预估收益\n仅从 SQL 写法看，保守预计优化收益为 1.2x~2x。若两个分区结果量较大且去重成本较高，收益可能更明显；若结果量较小或确实需要全局去重，收益有限。",
+    "stages": {
+      "node2_retrieval_query": "UNION 隐式去重 ; UNION ALL deduplicate",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-030] UNION 应改 UNION ALL",
+        "## 知识卡索引",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 根因",
+        "### 根因",
+        "### 建议方向（不给出完整改写 SQL）"
+      ],
+      "node4_elapsed_s": 16.9,
+      "node4_usage": {
+        "completion_tokens": 1387,
+        "prompt_tokens": 3751,
+        "total_tokens": 5138,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 512
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 明确命中 UNION 隐式去重问题，`union` 会触发全局去重 Shuffle，若业务不需要去重可改为 UNION ALL 降低开销。\",\n  \"severity\": \"low\",\n  \"estimated_speedup\": \"1.2x~2x（取决于两个分区 uid 重复比例与去重规模）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"sql_anti_pattern\",\n      \"severity\": \"low\",\n      \"title\": \"UNION "
+    }
+  },
+  {
+    "model": "kimi-k2.6",
+    "case_id": 7,
+    "case_label": "CASE-7 clean SQL (fallback)",
+    "score": {
+      "hit_categories": [],
+      "missing": [],
+      "extra": [
+        "sql_anti_pattern"
+      ],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 已使用分区字段 dt 过滤，且未命中 SELECT *、JOIN、排序、子查询等常见慢 SQL 写法问题。",
+      "severity": "low",
+      "estimated_speedup": "无明显 SQL 写法优化空间",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "未发现明显写法问题",
+          "evidence": "SQL 片段为 `select order_id, amount from dwd_order where dt='20250101'`；DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`，SQL 已使用分区字段 `dt` 过滤，且 SELECT 子句未出现 `*`，SQL 中未出现 JOIN、count(distinct)、order by、union、窗口函数、like、in 子查询等触发项。",
+          "root_cause": "基于当前 SQL 文本、DDL、容量与行数信息，12 项 SQL 写法 Checklist 均未命中，未发现可明确归因于 SQL 写法的慢任务问题。",
+          "recommendation": "建议保持当前按分区字段过滤与按需选择字段的写法；若任务仍运行超过 4 小时，应进一步人工核查实际扫描分区、分区文件数量、数据分布与执行计划，但这些已超出当前可由 SQL 文本直接确认的范围。",
+          "expected_gain": "未知，当前未发现明确 SQL 写法优化点"
+        }
+      ],
+      "needs_human_check": [
+        "请人工核查实际是否只扫描 `dt='20250101'` 对应分区，以及该分区的数据量是否异常偏大。",
+        "请人工抽查该分区下文件数量与文件大小是否异常，但该项不属于 SQL 写法本身问题。",
+        "若任务仍超过 4 小时，请结合执行计划确认实际扫描范围是否与 SQL 中的 `where dt='20250101'` 一致。"
+      ],
+      "markdown_report": "## 总结\n当前 SQL 为按分区字段 `dt` 过滤的简单明细查询：`select order_id, amount from dwd_order where dt='20250101'`。表 `dwd_order` 的 DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`，因此从 SQL 写法层面看，已具备分区剪枝条件，且未发现 SELECT *、JOIN、全局排序、UNION 去重、重复扫描、窗口函数、IN 子查询等明显慢 SQL 写法问题。\n\n## 问题列表\n### ISSUE-001 未发现明显写法问题\n- 证据：SQL 片段为 `select order_id, amount from dwd_order where dt='20250101'`；DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`。\n- 根因：12 项 SQL 写法 Checklist 均未命中，未发现可明确归因于 SQL 写法的慢任务问题。\n- 建议：保持当前按分区字段过滤、按需选择字段的写法；若运行仍超过 4 小时，需要人工核查实际扫描分区、分区数据量、文件情况与执行计划。\n- 预估收益：未知，当前未发现明确 SQL 写法优化点。\n\n## 需人工核查项\n- 请人工核查实际是否只扫描 `dt='20250101'` 对应分区，以及该分区的数据量是否异常偏大。\n- 请人工抽查该分区下文件数量与文件大小是否异常。\n- 若任务仍超过 4 小时，请结合执行计划确认实际扫描范围是否与 SQL 中的 `where dt='20250101'` 一致。\n\n## 预估收益\n当前 SQL 写法层面没有明确可优化问题，因此无法给出确定加速倍数。"
+    },
+    "result_markdown": "## 总结\n当前 SQL 为按分区字段 `dt` 过滤的简单明细查询：`select order_id, amount from dwd_order where dt='20250101'`。表 `dwd_order` 的 DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`，因此从 SQL 写法层面看，已具备分区剪枝条件，且未发现 SELECT *、JOIN、全局排序、UNION 去重、重复扫描、窗口函数、IN 子查询等明显慢 SQL 写法问题。\n\n## 问题列表\n### ISSUE-001 未发现明显写法问题\n- 证据：SQL 片段为 `select order_id, amount from dwd_order where dt='20250101'`；DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`。\n- 根因：12 项 SQL 写法 Checklist 均未命中，未发现可明确归因于 SQL 写法的慢任务问题。\n- 建议：保持当前按分区字段过滤、按需选择字段的写法；若运行仍超过 4 小时，需要人工核查实际扫描分区、分区数据量、文件情况与执行计划。\n- 预估收益：未知，当前未发现明确 SQL 写法优化点。\n\n## 需人工核查项\n- 请人工核查实际是否只扫描 `dt='20250101'` 对应分区，以及该分区的数据量是否异常偏大。\n- 请人工抽查该分区下文件数量与文件大小是否异常。\n- 若任务仍超过 4 小时，请结合执行计划确认实际扫描范围是否与 SQL 中的 `where dt='20250101'` 一致。\n\n## 预估收益\n当前 SQL 写法层面没有明确可优化问题，因此无法给出确定加速倍数。",
+    "stages": {
+      "node2_retrieval_query": "Hive SQL optimization ; select order_id, amount from dwd_order where dt='20250101';",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "### 问题 SQL",
+        "### 问题 SQL",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 问题 SQL（节选）",
+        "### 问题 SQL（节选）"
+      ],
+      "node4_elapsed_s": 14.0,
+      "node4_usage": {
+        "completion_tokens": 1234,
+        "prompt_tokens": 3649,
+        "total_tokens": 4883,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 349
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 已使用分区字段 dt 过滤，且未命中 SELECT *、JOIN、排序、子查询等常见慢 SQL 写法问题。\",\n  \"severity\": \"low\",\n  \"estimated_speedup\": \"无明显 SQL 写法优化空间\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"sql_anti_pattern\",\n      \"severity\": \"low\",\n      \"title\": \"未发现明显写法问题\",\n      \"evidence\": \"SQL 片段为"
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 1,
+    "case_label": "CASE-1 big-small JOIN + select *",
+    "score": {
+      "hit_categories": [
+        "join_strategy",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 2
+    },
+    "result_json": {
+      "summary": "500GB 大表 dwd_order 上的 LEFT JOIN 缺少 MapJoin 提示（dim_user 仅 50MB），同时使用 select a.* 拉宽列传输，整体可显著加速",
+      "severity": "high",
+      "estimated_speedup": "3x~5x（仅 SQL 写法层面保守估计）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "join_strategy",
+          "severity": "high",
+          "title": "大小表 LEFT JOIN 缺少 MapJoin 提示",
+          "evidence": "SQL 为 `left join dim_user b on a.user_id=b.uid`；根据 tables，dim_user size_bytes=50MB（< 100MB）、row_count=10,000,000，属于典型小维度表；SQL 中没有任何 `/*+ MAPJOIN(b) */` 提示。",
+          "root_cause": "dwd_order 容量 500GB、50 亿行，dim_user 仅 50MB。若不强制 MapJoin，Hive 默认走 common join（reduce 端 shuffle+join），500 亿行级别的 key 全部经过 shuffle，会消耗大量网络与磁盘 IO，并增加 reducer 端压力。",
+          "recommendation": "建议让 Hive 将 dim_user 广播到所有 mapper 端，在 map 阶段完成关联，避免 shuffle。可在 LEFT JOIN 的右表（dim_user）一侧添加 /*+ MAPJOIN(b) */ 提示（或等价写法），让小维度表走 Broadcast 路径。同时需确保 JOIN 语义允许 broadcast（左表为大表、右表为小表的 LEFT JOIN 是 MapJoin 的经典适用场景）。",
+          "expected_gain": "3x~5x"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "使用 select a.* 拉宽列传输",
+          "evidence": "SQL 首句 `select a.* from dwd_order a ...`；dwd_order DDL 包含 order_id、user_id、amount 三个字段，select a.* 会将所有字段一并返回。",
+          "root_cause": "select * 会读取表中全部列，ORC 虽然是列存格式（已具备列裁剪能力），但 `a.*` 仍会从 dwd_order 中拉取所有字段，输出阶段会带出后续不需要的列，造成 mapper→reducer（或下游）网络/序列化开销膨胀；在 TEZ 容器间也会拉宽数据通道。",
+          "recommendation": "建议按需列出 a 表真正需要的字段（例如只取 order_id、user_id、amount 以及 JOIN 后真正参与后续聚合/过滤的列），避免 `a.*` 写法，进一步配合列存裁剪。",
+          "expected_gain": "1.2x~2x（取决于输出列数与最终消费方）"
+        }
+      ],
+      "needs_human_check": [
+        "LEFT JOIN 关联键 a.user_id = b.uid 是否存在类型/格式不一致（例如 user_id 为 NULL、空串、或两侧精度/编码不同），人工抽样核查关联命中率",
+        "dwd_order 实际 dt='20250101' 分区数据量是否健康，是否存在历史膨胀或脏数据，导致单分区扫描量异常",
+        "下游消费方是否确实需要 dwd_order 的所有列，确认 select a.* 是否会被裁剪"
+      ],
+      "markdown_report": "## 总结\n本 SQL 是一条 `dwd_order (500GB) left join dim_user (50MB)` 的关联查询，WHERE 已经正确使用分区字段 `a.dt='20250101'` 进行分区裁剪，存储格式也是 ORC。**主要问题有两点**：一是 50MB 的小维度表 dim_user 没有走 MapJoin，被迫与 500GB 大表 shuffle 关联；二是 `select a.*` 拉宽了输出列。两者都属于纯 SQL 写法层面的问题，优化空间较为明显。\n\n## 问题列表\n\n### ISSUE-001 大小表 LEFT JOIN 缺少 MapJoin 提示（join_strategy / high）\n- **证据**：SQL `left join dim_user b on a.user_id=b.uid`；tables 显示 dim_user size_bytes=50MB（< 100MB）、row_count=10000000；SQL 中没有 `/*+ MAPJOIN(b) */` 提示。\n- **根因**：dwd_order 容量 500GB、50 亿行，dim_user 仅 50MB。未显式提示 MapJoin 时，Hive 默认走 common join（reduce 端 shuffle+join），500 亿行量级的 key 全部进入 shuffle，会消耗大量网络与磁盘 IO，并放大 reducer 端压力。\n- **建议**：让 dim_user 走 Broadcast，在 map 阶段完成关联。原则是：左大右小的 LEFT JOIN 非常适合把小表广播到 map 端，避免 shuffle。\n- **预估收益**：3x~5x\n\n### ISSUE-002 使用 select a.* 拉宽列传输（sql_anti_pattern / medium）\n- **证据**：SQL 首句 `select a.* from dwd_order a ...`；dwd_order DDL 中包含 order_id、user_id、amount 三个字段，`a.*` 会一并返回。\n- **根因**：ORC 虽然是列存、具备列裁剪能力，但 `a.*` 仍会把 dwd_order 的全部字段带入输出，序列化与下游传输都会变宽。\n- **建议**：按需枚举 a 表字段（order_id、user_id、amount 中真正会被消费方使用的列），去掉 `a.*`。\n- **预估收益**：1.2x~2x（取决于输出列数与消费方）\n\n## 需人工核查项\n- LEFT JOIN 关联键 `a.user_id = b.uid` 是否存在类型/格式不一致（NULL、空串、精度/编码差异），建议抽样核查关联命中率。\n- `dwd_order` 在 `dt='20250101'` 分区下的真实数据量是否健康，是否有历史膨胀/脏数据导致单分区扫描过大。\n- 下游消费方是否真的需要 `dwd_order` 的所有列，以决定 `a.*` 改写粒度。\n\n## 预估收益\n综合 MapJoin + 列裁剪两项改动，整体可获得约 3x~5x 的 SQL 写法层面加速（保守估计，实际收益依赖数据分布与执行计划）。"
+    },
+    "result_markdown": "## 总结\n本 SQL 是一条 `dwd_order (500GB) left join dim_user (50MB)` 的关联查询，WHERE 已经正确使用分区字段 `a.dt='20250101'` 进行分区裁剪，存储格式也是 ORC。**主要问题有两点**：一是 50MB 的小维度表 dim_user 没有走 MapJoin，被迫与 500GB 大表 shuffle 关联；二是 `select a.*` 拉宽了输出列。两者都属于纯 SQL 写法层面的问题，优化空间较为明显。\n\n## 问题列表\n\n### ISSUE-001 大小表 LEFT JOIN 缺少 MapJoin 提示（join_strategy / high）\n- **证据**：SQL `left join dim_user b on a.user_id=b.uid`；tables 显示 dim_user size_bytes=50MB（< 100MB）、row_count=10000000；SQL 中没有 `/*+ MAPJOIN(b) */` 提示。\n- **根因**：dwd_order 容量 500GB、50 亿行，dim_user 仅 50MB。未显式提示 MapJoin 时，Hive 默认走 common join（reduce 端 shuffle+join），500 亿行量级的 key 全部进入 shuffle，会消耗大量网络与磁盘 IO，并放大 reducer 端压力。\n- **建议**：让 dim_user 走 Broadcast，在 map 阶段完成关联。原则是：左大右小的 LEFT JOIN 非常适合把小表广播到 map 端，避免 shuffle。\n- **预估收益**：3x~5x\n\n### ISSUE-002 使用 select a.* 拉宽列传输（sql_anti_pattern / medium）\n- **证据**：SQL 首句 `select a.* from dwd_order a ...`；dwd_order DDL 中包含 order_id、user_id、amount 三个字段，`a.*` 会一并返回。\n- **根因**：ORC 虽然是列存、具备列裁剪能力，但 `a.*` 仍会把 dwd_order 的全部字段带入输出，序列化与下游传输都会变宽。\n- **建议**：按需枚举 a 表字段（order_id、user_id、amount 中真正会被消费方使用的列），去掉 `a.*`。\n- **预估收益**：1.2x~2x（取决于输出列数与消费方）\n\n## 需人工核查项\n- LEFT JOIN 关联键 `a.user_id = b.uid` 是否存在类型/格式不一致（NULL、空串、精度/编码差异），建议抽样核查关联命中率。\n- `dwd_order` 在 `dt='20250101'` 分区下的真实数据量是否健康，是否有历史膨胀/脏数据导致单分区扫描过大。\n- 下游消费方是否真的需要 `dwd_order` 的所有列，以决定 `a.*` 改写粒度。\n\n## 预估收益\n综合 MapJoin + 列裁剪两项改动，整体可获得约 3x~5x 的 SQL 写法层面加速（保守估计，实际收益依赖数据分布与执行计划）。",
+    "stages": {
+      "node2_retrieval_query": "select 星号 ; select star column pruning ; 小表 JOIN MapJoin ; MapJoin broadcast small table",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-020] 大小表 JOIN 未走 MapJoin",
+        "## 知识卡索引",
+        "## [KB-034] 嵌套子查询 / 老式逗号 JOIN",
+        "## [CASE-002] 多表 LEFT JOIN 中间结果膨胀",
+        "### 建议方向",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 36.7,
+      "node4_usage": {
+        "completion_tokens": 2076,
+        "prompt_tokens": 3606,
+        "total_tokens": 5682,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"500GB 大表 dwd_order 上的 LEFT JOIN 缺少 MapJoin 提示（dim_user 仅 50MB），同时使用 select a.* 拉宽列传输，整体可显著加速\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"3x~5x（仅 SQL 写法层面保守估计）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"join_strategy\",\n      \"severity\": \"high\",\n      \"title\""
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 2,
+    "case_label": "CASE-2 missing partition filter",
+    "score": {
+      "hit_categories": [
+        "partition_pruning"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "dwd_order 为按 dt 分区的 500GB 大表，SQL 仅用 create_time 过滤而未用分区字段 dt，导致无法分区裁剪，几乎等同于全表扫描，是本次慢任务最关键的问题。",
+      "severity": "critical",
+      "estimated_speedup": "取决于命中分区数量，若仅需近 1~7 天数据可达 50x~300x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "critical",
+          "title": "大表未按分区字段过滤，缺失分区裁剪",
+          "evidence": "dwd_order DDL: PARTITIONED BY (dt string)，容量 500GB / 50 亿行；SQL 仅有 `where create_time >= '2024-01-01'`，过滤字段为 create_time，并非分区字段 dt，WHERE 中没有任何对 dt 的过滤条件。",
+          "root_cause": "Hive 只会对分区字段 dt 做裁剪；create_time 是普通列，过滤时只能读取全部分区后在算子层过滤，造成 500GB 数据几乎全部被扫描，ORC 的 min/max/zonemap 等轻量裁剪也因 dt 未被引用而无法生效。",
+          "recommendation": "建议在 WHERE 中补充对分区字段 dt 的显式过滤（例如指定 dt 范围或 dt 列表），并尽量把 create_time 与 dt 之间的对应关系收敛在分区字段上；若业务侧只能按 create_time 过滤，需先确认 dt 与 create_time 的对应规则（例如 dt = substr(create_time,1,10) 或 dt = date_sub(create_time,n)），再据此改写过滤条件。仅做文字说明，不提供改写 SQL。",
+          "expected_gain": "取决于命中分区占全表比例，若仅需数日分区可达数十倍到数百倍；若需全量历史则收益有限"
+        }
+      ],
+      "needs_human_check": [
+        "create_time 字符串与 dt 分区值的对应关系（例如 dt 是否等于 substr(create_time,1,10)），请人工确认后再决定如何在 WHERE 中使用 dt。",
+        "'2024-01-01' 之后实际命中的 dt 分区数量及每个分区的数据量分布，用于预估 SQL 改写后的真实收益。",
+        "create_time 字段格式是否统一（是否存在非 yyyy-MM-dd 写法导致 to_date/cast 之后与 dt 不一致的情况）。",
+        "dwd_order 各 dt 分区是否存在数据倾斜或长尾，请抽样核查最重分区的数据量。"
+      ],
+      "markdown_report": "## 总结\n本次慢任务 SQL 非常简短：`select order_id, amount from dwd_order where create_time >= '2024-01-01';`，所涉及的 dwd_order 是 500GB / 50 亿行的大表，且 DDL 显示该表为 `PARTITIONED BY (dt string)` 的分区表，存储格式为 ORC。最关键的问题是 **WHERE 中并未对分区字段 dt 做过滤**，只用了普通列 create_time，因此 Hive 不会做分区裁剪，几乎等同于全表扫描。\n\n## 问题列表\n\n### ISSUE-001 ｜ 缺失分区裁剪（critical）\n- **证据**：dwd_order DDL 含 `PARTITIONED BY (dt string)`，容量 500GB / 50 亿行；SQL WHERE 子句为 `create_time >= '2024-01-01'`，过滤字段是 create_time，并非分区字段 dt，WHERE 中未出现任何 dt 过滤条件。\n- **根因**：Hive 只对分区字段 dt 做裁剪；create_time 是普通列，过滤只能在算子层进行，导致 500GB 数据几乎全部被读取。即便底层是 ORC、具备 min/max/zonemap 等轻量裁剪能力，也因为 dt 未被引用而难以发挥。\n- **建议**：在 WHERE 中增加对 dt 的显式过滤（例如按 dt 范围或 dt 列表），并把 create_time 与 dt 的对应规则收敛到分区字段上；如果业务侧无法绕过 create_time，请先人工确认 dt 与 create_time 的实际映射关系（例如 dt = substr(create_time,1,10)），再据此改写过滤条件。此处仅描述原则，不给出完整改写 SQL。\n- **预估收益**：取决于实际命中的 dt 分区占全表的比例。若只需近 1~7 天分区，预估可达 50x~300x；若需全量历史，则收益有限。\n\n## 需人工核查项\n- create_time 字符串与 dt 分区值的真实对应关系（例如 dt 是否等于 substr(create_time,1,10)），用以决定 dt 过滤应如何书写。\n- '2024-01-01' 之后实际命中的 dt 分区数量及每个分区的数据量分布，用于精确预估改写后的收益。\n- create_time 字段是否格式统一，是否存在非 yyyy-MM-dd 写法导致 to_date/cast 之后与 dt 不一致。\n- dwd_order 各 dt 分区是否存在明显的数据倾斜或长尾，请抽样核查最大分区的数据量。\n\n## 预估收益\n- 关键收益来自 ISSUE-001（分区裁剪），保守估计在仅需少量分区时可达数十倍到数百倍；具体数值依赖实际命中的分区数量，建议人工确认后再做最终评估。\n- 其他 11 项 Checklist 全部未命中，本次未生成相关 issue。"
+    },
+    "result_markdown": "## 总结\n本次慢任务 SQL 非常简短：`select order_id, amount from dwd_order where create_time >= '2024-01-01';`，所涉及的 dwd_order 是 500GB / 50 亿行的大表，且 DDL 显示该表为 `PARTITIONED BY (dt string)` 的分区表，存储格式为 ORC。最关键的问题是 **WHERE 中并未对分区字段 dt 做过滤**，只用了普通列 create_time，因此 Hive 不会做分区裁剪，几乎等同于全表扫描。\n\n## 问题列表\n\n### ISSUE-001 ｜ 缺失分区裁剪（critical）\n- **证据**：dwd_order DDL 含 `PARTITIONED BY (dt string)`，容量 500GB / 50 亿行；SQL WHERE 子句为 `create_time >= '2024-01-01'`，过滤字段是 create_time，并非分区字段 dt，WHERE 中未出现任何 dt 过滤条件。\n- **根因**：Hive 只对分区字段 dt 做裁剪；create_time 是普通列，过滤只能在算子层进行，导致 500GB 数据几乎全部被读取。即便底层是 ORC、具备 min/max/zonemap 等轻量裁剪能力，也因为 dt 未被引用而难以发挥。\n- **建议**：在 WHERE 中增加对 dt 的显式过滤（例如按 dt 范围或 dt 列表），并把 create_time 与 dt 的对应规则收敛到分区字段上；如果业务侧无法绕过 create_time，请先人工确认 dt 与 create_time 的实际映射关系（例如 dt = substr(create_time,1,10)），再据此改写过滤条件。此处仅描述原则，不给出完整改写 SQL。\n- **预估收益**：取决于实际命中的 dt 分区占全表的比例。若只需近 1~7 天分区，预估可达 50x~300x；若需全量历史，则收益有限。\n\n## 需人工核查项\n- create_time 字符串与 dt 分区值的真实对应关系（例如 dt 是否等于 substr(create_time,1,10)），用以决定 dt 过滤应如何书写。\n- '2024-01-01' 之后实际命中的 dt 分区数量及每个分区的数据量分布，用于精确预估改写后的收益。\n- create_time 字段是否格式统一，是否存在非 yyyy-MM-dd 写法导致 to_date/cast 之后与 dt 不一致。\n- dwd_order 各 dt 分区是否存在明显的数据倾斜或长尾，请抽样核查最大分区的数据量。\n\n## 预估收益\n- 关键收益来自 ISSUE-001（分区裁剪），保守估计在仅需少量分区时可达数十倍到数百倍；具体数值依赖实际命中的分区数量，建议人工确认后再做最终评估。\n- 其他 11 项 Checklist 全部未命中，本次未生成相关 issue。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-011] 分区裁剪缺失",
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-004] 动态分区写入长尾",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [KB-010] 列裁剪缺失（SELECT *）",
+        "## 知识卡索引"
+      ],
+      "node4_elapsed_s": 30.1,
+      "node4_usage": {
+        "completion_tokens": 1679,
+        "prompt_tokens": 3343,
+        "total_tokens": 5022,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"dwd_order 为按 dt 分区的 500GB 大表，SQL 仅用 create_time 过滤而未用分区字段 dt，导致无法分区裁剪，几乎等同于全表扫描，是本次慢任务最关键的问题。\",\"severity\":\"critical\",\"estimated_speedup\":\"取决于命中分区数量，若仅需近 1~7 天数据可达 50x~300x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"partition_pruning\",\"severity\":\"critical\",\"title\":\"大表未按分区字段过滤，缺失分区裁剪\",\"evide"
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 3,
+    "case_label": "CASE-3 multi count(distinct)",
+    "score": {
+      "hit_categories": [
+        "aggregation"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 命中 1 项：同一 SELECT 在 100GB 分区表上同时执行两个 count(distinct)，会触发单 Reducer 瓶颈；其余 11 项 Checklist 均未命中。",
+      "severity": "high",
+      "estimated_speedup": "2x~5x（取决于改写方式与数据分布）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "aggregation",
+          "severity": "high",
+          "title": "同一 SELECT 中出现 2 个 count(distinct) 且作用于 100GB 大表",
+          "evidence": "SQL 完整文本：`select count(distinct user_id) as uv, count(distinct order_id) as order_cnt from dwd_order where dt='20250101';`；同 SELECT 出现 `count(distinct user_id)` 与 `count(distinct order_id)` 两个 distinct 聚合；表 dwd_order 的 size_bytes=100GB，row_count=100000000，DDL 为 `CREATE TABLE dwd_order (order_id string, user_id string) PARTITIONED BY (dt string) STORED AS ORC`。",
+          "root_cause": "count(distinct ...) 在 Hive on MR/Tez 中默认汇聚到单 Reducer 完成去重，容易形成单点瓶颈；同一 SELECT 中存在两个 count(distinct) 时还需多一轮 shuffle，整体运行时间会被显著拉长。结合 KB-002/KB-031，distinct 本身就是单 Reducer 操作（按 channel 分组后每个 channel 仍是单 Reducer 处理 distinct），2 个 distinct 在 100GB 表上风险叠加。",
+          "recommendation": "建议思路（仅原则，不给完整改写）：避免在同一个 SELECT 中将多次 distinct 直接交给单 Reducer 汇总，可考虑把每个 distinct 拆为可并行/多 Reducer 的子任务（例如先按 group by 收敛再合并、或按 distinct 字段拆为多个子查询用 union all 汇总）。最终方案取决于业务对 uv、order_cnt 指标语义是否保持完全一致。",
+          "expected_gain": "2x~5x（取决于所选改写方式与 user_id / order_id 实际分布）"
+        }
+      ],
+      "needs_human_check": [
+        "dwd_order 分区 dt='20250101' 下 user_id 的基数与分布（潜在数据倾斜，请人工核查）",
+        "dwd_order 分区 dt='20250101' 下 order_id 的基数与分布（潜在数据倾斜，请人工核查）",
+        "dwd_order 分区 dt='20250101' 下 user_id / order_id 是否存在大量 NULL 或空字符串（潜在 hash 倾斜，请人工核查）",
+        "建议人工抽查 SQL 在 Tez/MR 下的执行计划，确认 2 个 count(distinct) 是否分别落到独立的 single-reducer stage，以判断本次优化潜力"
+      ],
+      "markdown_report": "## 总结\n\n针对 `select count(distinct user_id) as uv, count(distinct order_id) as order_cnt from dwd_order where dt='20250101';` 这条 SQL，依据 12 项 Checklist 走查，命中 1 项：CHK-4（多次 count(distinct) + 大表），其余 11 项（分区剪枝、SELECT *、MapJoin 缺失、ORDER BY 无 LIMIT、UNION 隐式去重、重复扫描、空窗口、笛卡尔积、LIKE 模糊匹配、TEXTFILE 存储、IN 子查询）均不命中。核心问题是同一 SELECT 在 100GB 分区表 dwd_order 上同时执行两次 count(distinct)，会触发单 Reducer 瓶颈。\n\n## Checklist 走查明细\n\n| 编号 | 项 | 内部判断 | 命中证据 |\n|------|----|---------|---------|\n| CHK-1 | partition_pruning | 不命中 | dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL WHERE 已有 `dt='20250101'`，分区剪枝生效 |\n| CHK-2 | select_star | 不命中 | SELECT 子句为 `count(distinct user_id) as uv, count(distinct order_id) as order_cnt`，无 `*` 或 `表.*` |\n| CHK-3 | join_mapjoin | 不命中 | SQL 中无任何 JOIN |\n| CHK-4 | multi_count_distinct | **命中** | 同一 SELECT 出现 `count(distinct user_id)` 与 `count(distinct order_id)` 共 2 个 distinct，且 dwd_order 100GB |\n| CHK-5 | order_by_no_limit | 不命中 | SQL 中无 `order by` |\n| CHK-6 | union_not_all | 不命中 | SQL 中无 UNION |\n| CHK-7 | repeated_table_scan | 不命中 | dwd_order 在 FROM 中只被引用 1 次 |\n| CHK-8 | window_no_partition | 不命中 | SQL 中无 `over(...)` 窗口函数 |\n| CHK-9 | cartesian_join | 不命中 | SQL 中无 JOIN |\n| CHK-10 | like_wildcard | 不命中 | SQL 中无 LIKE |\n| CHK-11 | textfile_format | 不命中 | DDL 为 `STORED AS ORC`，是列存格式 |\n| CHK-12 | in_subquery | 不命中 | SQL 中无 IN / NOT IN 子查询 |\n\n## 问题列表\n\n### ISSUE-001（CHK-4 / aggregation / high）\n- **问题**：同一 SELECT 中出现 2 个 count(distinct) 且作用于 100GB 大表\n- **证据**：SQL 完整文本 `select count(distinct user_id) as uv, count(distinct order_id) as order_cnt from dwd_order where dt='20250101';`；同 SELECT 出现 `count(distinct user_id)` 与 `count(distinct order_id)` 两个 distinct 聚合；表 dwd_order size_bytes=100GB，row_count=100000000\n- **根因**：count(distinct ...) 在 Hive on MR/Tez 中默认汇聚到单 Reducer 完成去重，单 Reducer 容易成为瓶颈；同一 SELECT 中存在两个 count(distinct) 时还需多一轮 shuffle，运行时间被显著拉长。涉及知识库条目 KB-002（DISTINCT 单点瓶颈）、KB-031（COUNT(DISTINCT) 单 Reducer）\n- **建议**：将多次 distinct 拆为可并行/多 Reducer 的子任务再合并，避免单点 Reducer 承接全部去重数据；具体方案取决于业务对 uv、order_cnt 指标语义是否保持完全一致（不给出完整改写 SQL）\n- **预估收益**：2x~5x（取决于改写方式与 user_id / order_id 实际分布）\n\n## 需人工核查项\n\n- dwd_order 分区 dt='20250101' 下 user_id 的基数与分布（潜在数据倾斜，请人工核查）\n- dwd_order 分区 dt='20250101' 下 order_id 的基数与分布（潜在数据倾斜，请人工核查）\n- dwd_order 分区 dt='20250101' 下 user_id / order_id 是否存在大量 NULL 或空字符串（潜在 hash 倾斜，请人工核查）\n- 建议人工抽查 SQL 在 Tez/MR 下的执行计划，确认 2 个 count(distinct) 是否分别落到独立的 single-reducer stage，以判断本次优化潜力\n\n## 预估收益\n\n仅 1 条 issue，命中 CHK-4（多次 count(distinct) + 100GB 大表）。若按原则将两次 distinct 拆为可多 Reducer 并行的子任务再合并，整体预估收益 2x~5x，强烈依赖 user_id / order_id 的实际基数与分布，需要人工核查后确认最终方案。"
+    },
+    "result_markdown": "## 总结\n\n针对 `select count(distinct user_id) as uv, count(distinct order_id) as order_cnt from dwd_order where dt='20250101';` 这条 SQL，依据 12 项 Checklist 走查，命中 1 项：CHK-4（多次 count(distinct) + 大表），其余 11 项（分区剪枝、SELECT *、MapJoin 缺失、ORDER BY 无 LIMIT、UNION 隐式去重、重复扫描、空窗口、笛卡尔积、LIKE 模糊匹配、TEXTFILE 存储、IN 子查询）均不命中。核心问题是同一 SELECT 在 100GB 分区表 dwd_order 上同时执行两次 count(distinct)，会触发单 Reducer 瓶颈。\n\n## Checklist 走查明细\n\n| 编号 | 项 | 内部判断 | 命中证据 |\n|------|----|---------|---------|\n| CHK-1 | partition_pruning | 不命中 | dwd_order DDL 含 `PARTITIONED BY (dt string)`，SQL WHERE 已有 `dt='20250101'`，分区剪枝生效 |\n| CHK-2 | select_star | 不命中 | SELECT 子句为 `count(distinct user_id) as uv, count(distinct order_id) as order_cnt`，无 `*` 或 `表.*` |\n| CHK-3 | join_mapjoin | 不命中 | SQL 中无任何 JOIN |\n| CHK-4 | multi_count_distinct | **命中** | 同一 SELECT 出现 `count(distinct user_id)` 与 `count(distinct order_id)` 共 2 个 distinct，且 dwd_order 100GB |\n| CHK-5 | order_by_no_limit | 不命中 | SQL 中无 `order by` |\n| CHK-6 | union_not_all | 不命中 | SQL 中无 UNION |\n| CHK-7 | repeated_table_scan | 不命中 | dwd_order 在 FROM 中只被引用 1 次 |\n| CHK-8 | window_no_partition | 不命中 | SQL 中无 `over(...)` 窗口函数 |\n| CHK-9 | cartesian_join | 不命中 | SQL 中无 JOIN |\n| CHK-10 | like_wildcard | 不命中 | SQL 中无 LIKE |\n| CHK-11 | textfile_format | 不命中 | DDL 为 `STORED AS ORC`，是列存格式 |\n| CHK-12 | in_subquery | 不命中 | SQL 中无 IN / NOT IN 子查询 |\n\n## 问题列表\n\n### ISSUE-001（CHK-4 / aggregation / high）\n- **问题**：同一 SELECT 中出现 2 个 count(distinct) 且作用于 100GB 大表\n- **证据**：SQL 完整文本 `select count(distinct user_id) as uv, count(distinct order_id) as order_cnt from dwd_order where dt='20250101';`；同 SELECT 出现 `count(distinct user_id)` 与 `count(distinct order_id)` 两个 distinct 聚合；表 dwd_order size_bytes=100GB，row_count=100000000\n- **根因**：count(distinct ...) 在 Hive on MR/Tez 中默认汇聚到单 Reducer 完成去重，单 Reducer 容易成为瓶颈；同一 SELECT 中存在两个 count(distinct) 时还需多一轮 shuffle，运行时间被显著拉长。涉及知识库条目 KB-002（DISTINCT 单点瓶颈）、KB-031（COUNT(DISTINCT) 单 Reducer）\n- **建议**：将多次 distinct 拆为可并行/多 Reducer 的子任务再合并，避免单点 Reducer 承接全部去重数据；具体方案取决于业务对 uv、order_cnt 指标语义是否保持完全一致（不给出完整改写 SQL）\n- **预估收益**：2x~5x（取决于改写方式与 user_id / order_id 实际分布）\n\n## 需人工核查项\n\n- dwd_order 分区 dt='20250101' 下 user_id 的基数与分布（潜在数据倾斜，请人工核查）\n- dwd_order 分区 dt='20250101' 下 order_id 的基数与分布（潜在数据倾斜，请人工核查）\n- dwd_order 分区 dt='20250101' 下 user_id / order_id 是否存在大量 NULL 或空字符串（潜在 hash 倾斜，请人工核查）\n- 建议人工抽查 SQL 在 Tez/MR 下的执行计划，确认 2 个 count(distinct) 是否分别落到独立的 single-reducer stage，以判断本次优化潜力\n\n## 预估收益\n\n仅 1 条 issue，命中 CHK-4（多次 count(distinct) + 100GB 大表）。若按原则将两次 distinct 拆为可多 Reducer 并行的子任务再合并，整体预估收益 2x~5x，强烈依赖 user_id / order_id 的实际基数与分布，需要人工核查后确认最终方案。",
+    "stages": {
+      "node2_retrieval_query": "count distinct 多字段 ; count distinct skew",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-031] COUNT(DISTINCT) 单 Reducer",
+        "## 知识卡索引",
+        "### 问题诊断",
+        "## 真实案例索引",
+        "## [KB-002] DISTINCT 单点瓶颈"
+      ],
+      "node4_elapsed_s": 41.3,
+      "node4_usage": {
+        "completion_tokens": 3020,
+        "prompt_tokens": 3592,
+        "total_tokens": 6612,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 命中 1 项：同一 SELECT 在 100GB 分区表上同时执行两个 count(distinct)，会触发单 Reducer 瓶颈；其余 11 项 Checklist 均未命中。\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"2x~5x（取决于改写方式与数据分布）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"aggregation\",\n      \"severity\": \"high\",\n      \"title\":"
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 4,
+    "case_label": "CASE-4 ORDER BY no LIMIT + select *",
+    "score": {
+      "hit_categories": [
+        "partition_pruning",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 3
+    },
+    "result_json": {
+      "summary": "对 500GB 分区大表 dwd_order 进行了 select * + 全表扫描 + 全局 ORDER BY 无 LIMIT 的写法，是典型的慢 SQL 三连。",
+      "severity": "critical",
+      "estimated_speedup": "10x~100x（仅 SQL 写法层面）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "critical",
+          "title": "未使用分区字段过滤，500GB 分区表被全量扫描",
+          "evidence": "dwd_order 的 DDL 包含 `PARTITIONED BY (dt string)`，但 SQL 整句 `select * from dwd_order order by create_time desc;` 没有 WHERE 子句，因此完全无法按 dt 进行分区剪枝；表容量 500.0GB、行数 5,000,000,000。",
+          "root_cause": "Hive 只会对分区列做剪枝优化，缺少 dt 过滤意味着会扫遍所有历史分区，IO 与计算量都被放大到全表规模。",
+          "recommendation": "原则：所有对分区大表的查询都应在 WHERE 中显式带上 dt（或 dt 范围）做分区剪枝；按业务需要限定到最近若干天的分区，避免全分区扫描。",
+          "expected_gain": "取决于实际限定分区数；若仅保留近 1 天分区，理论可缩减到原来的 1/365 量级。"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "使用 SELECT *，列存 ORC 表无法做列裁剪",
+          "evidence": "SQL 完整为 `select * from dwd_order order by create_time desc;`，直接读取 SELECT *；表存储格式为 ORC，本应可享受列裁剪。",
+          "root_cause": "SELECT * 会让 ORC 的列式读取优势失效，所有列（含大字段）都会被读出、解压、传输，增加 IO、反序列化与 Shuffle 数据量。",
+          "recommendation": "原则：只 SELECT 业务真正需要的列；本例若仅关心 create_time 排序结果，应只 select order_id、create_time 等必要列。",
+          "expected_gain": "中等，通常 1.5x~3x，取决于实际列数与字段宽度。"
+        },
+        {
+          "id": "ISSUE-003",
+          "category": "sql_anti_pattern",
+          "severity": "critical",
+          "title": "全局 ORDER BY 无 LIMIT，5 亿行数据走单 Reducer 全量排序",
+          "evidence": "SQL 末尾为 `order by create_time desc;`，没有 LIMIT；Hive 的 ORDER BY 语义是全局排序，会强制只用一个 Reducer 处理 5,000,000,000 行数据。",
+          "root_cause": "单 Reducer 排序是 ORDER BY 的硬性语义，无法并行；缺少 LIMIT 意味着即使只需要 Top N，也要把全量数据完成全局排序后才返回。",
+          "recommendation": "原则：如果业务目标是 Top N，应改用 SORT BY + 窗口函数（row_number()）或 SORT BY + LIMIT 取得每 Reducer 内的 Top N 后再归并；若确需全局排序，则必须配合 LIMIT，并考虑把过滤/聚合前置以减小排序数据集。",
+          "expected_gain": "high，从单 Reducer 排序 5 亿行变为有限 Reducer 处理小数据量，常见 10x~100x。"
+        }
+      ],
+      "needs_human_check": [
+        "dwd_order 的 dt 分区粒度（天/小时）以及业务上允许查询的时间范围，请人工确认合理的分区过滤窗口",
+        "业务是否真的需要按 create_time 排序后返回全量结果，还是仅需要 Top N，请人工确认",
+        "dwd_order 各分区的数据量是否均匀，是否存在单分区极大导致进一步倾斜（无法从元信息直接判断，建议抽样核查分区文件大小）"
+      ],
+      "markdown_report": "## 总结\n本任务对一张 500GB、50 亿行、ORC 存储且按 dt 分区的 dwd_order 表执行了 `select * from dwd_order order by create_time desc;`，同时命中 3 个高危写法问题：缺失分区剪枝、SELECT * 浪费列裁剪、全局 ORDER BY 无 LIMIT 触发单 Reducer 全量排序。综合下来，仅靠 SQL 写法层面优化就有 10x~100x 的提速空间。\n\n## 问题列表\n\n### ISSUE-001 分区剪枝缺失（critical）\n- **证据**：dwd_order DDL 包含 `PARTITIONED BY (dt string)`，SQL 整句没有 WHERE 子句。表容量 500.0GB，行数 5,000,000,000。\n- **根因**：Hive 只会按分区列做剪枝，缺 dt 过滤会扫遍所有历史分区。\n- **建议**：在 WHERE 中显式带 dt 范围，按业务限定到最近若干天分区。\n- **预估收益**：取决于限定分区数；若仅取近 1 天分区，可缩减到约 1/365 量级。\n\n### ISSUE-002 SELECT * 导致列裁剪失效（medium）\n- **证据**：SQL 为 `select * from dwd_order ...`；表存储为 ORC。\n- **根因**：ORC 列存优势依赖列裁剪，SELECT * 会让所有列都被读出、解压、传输。\n- **建议**：只 SELECT 业务所需列，本例若只关心排序结果，只需 order_id、create_time 等必要列。\n- **预估收益**：常见 1.5x~3x。\n\n### ISSUE-003 全局 ORDER BY 无 LIMIT（critical）\n- **证据**：SQL 末尾 `order by create_time desc;`，无 LIMIT；ORDER BY 在 Hive 中强制单 Reducer 全局排序。\n- **根因**：50 亿行单 Reducer 排序无并行能力；无 LIMIT 即便只要 Top N 也要全量排完。\n- **建议**：若目标是 Top N，用 SORT BY + 窗口函数或 SORT BY + LIMIT；若确需全局排序则必须配 LIMIT，并尽量前置过滤聚合以缩小排序集。\n- **预估收益**：常见 10x~100x。\n\n## 需人工核查项\n- dwd_order 的 dt 分区粒度（天/小时）以及业务允许的时间窗口，请人工确认合理分区范围。\n- 业务是否真的需要排序后返回全量，还是仅需 Top N，请人工确认。\n- dwd_order 各分区的数据量是否均匀，是否存在单分区极大导致进一步倾斜（无法从元信息直接判断）。\n\n## 预估收益\n仅 SQL 写法层面：3 个问题叠加保守估计 10x~100x，瓶颈点集中在 ISSUE-001 与 ISSUE-003。"
+    },
+    "result_markdown": "## 总结\n本任务对一张 500GB、50 亿行、ORC 存储且按 dt 分区的 dwd_order 表执行了 `select * from dwd_order order by create_time desc;`，同时命中 3 个高危写法问题：缺失分区剪枝、SELECT * 浪费列裁剪、全局 ORDER BY 无 LIMIT 触发单 Reducer 全量排序。综合下来，仅靠 SQL 写法层面优化就有 10x~100x 的提速空间。\n\n## 问题列表\n\n### ISSUE-001 分区剪枝缺失（critical）\n- **证据**：dwd_order DDL 包含 `PARTITIONED BY (dt string)`，SQL 整句没有 WHERE 子句。表容量 500.0GB，行数 5,000,000,000。\n- **根因**：Hive 只会按分区列做剪枝，缺 dt 过滤会扫遍所有历史分区。\n- **建议**：在 WHERE 中显式带 dt 范围，按业务限定到最近若干天分区。\n- **预估收益**：取决于限定分区数；若仅取近 1 天分区，可缩减到约 1/365 量级。\n\n### ISSUE-002 SELECT * 导致列裁剪失效（medium）\n- **证据**：SQL 为 `select * from dwd_order ...`；表存储为 ORC。\n- **根因**：ORC 列存优势依赖列裁剪，SELECT * 会让所有列都被读出、解压、传输。\n- **建议**：只 SELECT 业务所需列，本例若只关心排序结果，只需 order_id、create_time 等必要列。\n- **预估收益**：常见 1.5x~3x。\n\n### ISSUE-003 全局 ORDER BY 无 LIMIT（critical）\n- **证据**：SQL 末尾 `order by create_time desc;`，无 LIMIT；ORDER BY 在 Hive 中强制单 Reducer 全局排序。\n- **根因**：50 亿行单 Reducer 排序无并行能力；无 LIMIT 即便只要 Top N 也要全量排完。\n- **建议**：若目标是 Top N，用 SORT BY + 窗口函数或 SORT BY + LIMIT；若确需全局排序则必须配 LIMIT，并尽量前置过滤聚合以缩小排序集。\n- **预估收益**：常见 10x~100x。\n\n## 需人工核查项\n- dwd_order 的 dt 分区粒度（天/小时）以及业务允许的时间窗口，请人工确认合理分区范围。\n- 业务是否真的需要排序后返回全量，还是仅需 Top N，请人工确认。\n- dwd_order 各分区的数据量是否均匀，是否存在单分区极大导致进一步倾斜（无法从元信息直接判断）。\n\n## 预估收益\n仅 SQL 写法层面：3 个问题叠加保守估计 10x~100x，瓶颈点集中在 ISSUE-001 与 ISSUE-003。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning ; select 星号 ; select star column pruning ; order by 全局排序 无 limit ; order by no limit global sort",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-050] 全局 ORDER BY 无 LIMIT",
+        "## [CASE-001] 大表 ORDER BY 全局排序",
+        "## 知识卡索引",
+        "### 排序语法对比",
+        "### 问题诊断",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 36.7,
+      "node4_usage": {
+        "completion_tokens": 1825,
+        "prompt_tokens": 3572,
+        "total_tokens": 5397,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"对 500GB 分区大表 dwd_order 进行了 select * + 全表扫描 + 全局 ORDER BY 无 LIMIT 的写法，是典型的慢 SQL 三连。\",\n  \"severity\": \"critical\",\n  \"estimated_speedup\": \"10x~100x（仅 SQL 写法层面）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"partition_pruning\",\n      \"severity\": \"critical\",\n      \"title"
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 5,
+    "case_label": "CASE-5 same table scanned 3 times",
+    "score": {
+      "hit_categories": [
+        "subquery"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "FCT_ACTIVITY（50GB）在三个子查询中被重复扫描 3 次，是该慢任务最关键的问题。",
+      "severity": "high",
+      "estimated_speedup": "2x~3x（仅 SQL 写法层面保守估计）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "subquery",
+          "severity": "high",
+          "title": "FCT_ACTIVITY 同一表被 3 个子查询重复扫描",
+          "evidence": "SQL 中存在 3 个结构相同的子查询：`(select process_id from FCT_ACTIVITY where link_define_nm='answer-plan')`、`(select process_id from FCT_ACTIVITY where link_define_nm='intake')`、`(select process_id from FCT_ACTIVITY where link_define_nm='design-doc')`，均通过 left join 关联到 fact_order。FCT_ACTIVITY 容量 50GB、行数 5000 万。",
+          "root_cause": "FCT_ACTIVITY 没有分区键（DDL 中无 PARTITIONED BY），三次子查询会各自完整读取 FCT_ACTIVITY 全量数据，物理上对 50GB 的表做 3 次全表扫描，IO 与 Shuffle 成本线性放大 3 倍。",
+          "recommendation": "考虑将 3 次子查询合并为 1 次对 FCT_ACTIVITY 的扫描：一次扫描后通过 SUM(CASE WHEN link_define_nm='answer-plan' THEN 1 ELSE 0 END) 等条件聚合或 EXISTS/IN 语义表达“是否命中某 link_define_nm”，并在外部 JOIN 中按布尔判断连接，或在 ON 条件中按 link_define_nm 区分。这样 FCT_ACTIVITY 只会被读 1 次。",
+          "expected_gain": "2x~3x（取决于 link_define_nm 的筛选率；筛选率越低收益越接近 3x）"
+        }
+      ],
+      "needs_human_check": [
+        "FCT_ACTIVITY.link_define_nm 三个取值（'answer-plan' / 'intake' / 'design-doc'）各自的行数占比与每条 process_id 是否唯一，请人工抽样核查，以判断合并后聚合粒度的可行性。",
+        "fact_order.process_id 关联键是否存在大量 NULL 或空字符串（潜在数据倾斜风险），建议抽样核查。",
+        "FCT_ACTIVITY 是否存在按 dt/end_tm 等时间字段做分区的下游优化空间，请人工核查。"
+      ],
+      "markdown_report": "## 总结\n本任务最关键的问题是 FCT_ACTIVITY（50GB）被 3 个 LEFT JOIN 子查询分别全表扫描 3 次，造成大量重复 IO 与 Shuffle。建议将 3 次扫描合并为 1 次条件聚合/条件连接，仅在 SQL 写法层面即可获得显著收益。\n\n## 问题列表\n\n### ISSUE-001：FCT_ACTIVITY 同一表被 3 个子查询重复扫描（subquery / high）\n- **证据**：SQL 中 3 个子查询结构完全相同，仅 WHERE 条件 `link_define_nm` 不同；FCT_ACTIVITY 容量 50GB、行数 5000 万，且 DDL 中无 `PARTITIONED BY`，意味着每次子查询都是全表扫描。\n- **根因**：FCT_ACTIVITY 无分区键，无法利用分区剪枝；3 个子查询彼此独立，引擎不会自动合并，等价于对同一张大表读取 3 次。\n- **建议**：将 3 个子查询合并为 1 次对 FCT_ACTIVITY 的扫描，通过 `SUM(CASE WHEN link_define_nm='xxx' THEN 1 ELSE 0 END) > 0` 或类似布尔化处理（亦可借助 `MAX(CASE ...)`）生成“是否命中各 link_define_nm”的标志，再与 fact_order 按 process_id 做一次 JOIN；外层通过该布尔/标志判断是否连接成功，语义等价但 IO 降为原来的约 1/3。\n- **预估收益**：2x~3x。\n\n## 需人工核查项\n- FCT_ACTIVITY.link_define_nm 三个取值的行数占比与 process_id 唯一性，以确认合并后聚合粒度是否可行。\n- fact_order.process_id 关联键是否存在大量 NULL/空串（潜在倾斜风险）。\n- FCT_ACTIVITY 业务上是否可加 dt/end_tm 等时间分区，以便进一步剪枝。\n\n## 预估收益\n仅 SQL 写法层面保守估计可获得 2x~3x 加速；其他 11 项 Checklist 未命中（分区已正确剪枝、SELECT 精确取列、无 ORDER BY、无 UNION、无窗口函数、无笛卡尔积、无 LIKE 模糊匹配、存储为 ORC、无 IN 子查询、无需 MAPJOIN 的小表、无多 count(distinct)）。"
+    },
+    "result_markdown": "## 总结\n本任务最关键的问题是 FCT_ACTIVITY（50GB）被 3 个 LEFT JOIN 子查询分别全表扫描 3 次，造成大量重复 IO 与 Shuffle。建议将 3 次扫描合并为 1 次条件聚合/条件连接，仅在 SQL 写法层面即可获得显著收益。\n\n## 问题列表\n\n### ISSUE-001：FCT_ACTIVITY 同一表被 3 个子查询重复扫描（subquery / high）\n- **证据**：SQL 中 3 个子查询结构完全相同，仅 WHERE 条件 `link_define_nm` 不同；FCT_ACTIVITY 容量 50GB、行数 5000 万，且 DDL 中无 `PARTITIONED BY`，意味着每次子查询都是全表扫描。\n- **根因**：FCT_ACTIVITY 无分区键，无法利用分区剪枝；3 个子查询彼此独立，引擎不会自动合并，等价于对同一张大表读取 3 次。\n- **建议**：将 3 个子查询合并为 1 次对 FCT_ACTIVITY 的扫描，通过 `SUM(CASE WHEN link_define_nm='xxx' THEN 1 ELSE 0 END) > 0` 或类似布尔化处理（亦可借助 `MAX(CASE ...)`）生成“是否命中各 link_define_nm”的标志，再与 fact_order 按 process_id 做一次 JOIN；外层通过该布尔/标志判断是否连接成功，语义等价但 IO 降为原来的约 1/3。\n- **预估收益**：2x~3x。\n\n## 需人工核查项\n- FCT_ACTIVITY.link_define_nm 三个取值的行数占比与 process_id 唯一性，以确认合并后聚合粒度是否可行。\n- fact_order.process_id 关联键是否存在大量 NULL/空串（潜在倾斜风险）。\n- FCT_ACTIVITY 业务上是否可加 dt/end_tm 等时间分区，以便进一步剪枝。\n\n## 预估收益\n仅 SQL 写法层面保守估计可获得 2x~3x 加速；其他 11 项 Checklist 未命中（分区已正确剪枝、SELECT 精确取列、无 ORDER BY、无 UNION、无窗口函数、无笛卡尔积、无 LIKE 模糊匹配、存储为 ORC、无 IN 子查询、无需 MAPJOIN 的小表、无多 count(distinct)）。",
+    "stages": {
+      "node2_retrieval_query": "同表重复扫描 ; repeated table scan grouping sets",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [CASE-004] 同表重复扫描",
+        "## [KB-033] 同表多次扫描应 CASE WHEN 合并",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [CASE-010] OR 逻辑错误导致全表扫描",
+        "## 真实案例索引",
+        "### 根因"
+      ],
+      "node4_elapsed_s": 36.4,
+      "node4_usage": {
+        "completion_tokens": 1796,
+        "prompt_tokens": 3460,
+        "total_tokens": 5256,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"FCT_ACTIVITY（50GB）在三个子查询中被重复扫描 3 次，是该慢任务最关键的问题。\",\n  \"severity\": \"high\",\n  \"estimated_speedup\": \"2x~3x（仅 SQL 写法层面保守估计）\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"subquery\",\n      \"severity\": \"high\",\n      \"title\": \"FCT_ACTIVITY 同一表被 3 个子查询重复扫描\",\n      \"evidence\""
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 6,
+    "case_label": "CASE-6 UNION should be UNION ALL",
+    "score": {
+      "hit_categories": [
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 唯一明显的写法问题是使用 `UNION` 而非 `UNION ALL`，会触发额外的全局去重 shuffle；表本身分区裁剪正常、存储为 ORC、无 JOIN/窗口/排序问题。",
+      "severity": "low",
+      "estimated_speedup": "1.3x~2x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "UNION 隐式去重，多一次全局 shuffle",
+          "evidence": "SQL 末尾使用 `union` 连接两条 `select uid from dwd_user_active ... dt='...'`，未使用 `union all`",
+          "root_cause": "`UNION` 语义上等价于 `UNION ALL` + 全局 DISTINCT，会在 Reduce 阶段对两路 uid 做一次全量去重 shuffle；当两天的 uid 集合本身就几乎不重复（典型 DWD 行为宽表）时，这步去重是无谓开销",
+          "recommendation": "若业务可接受重复行（或下游会自行去重），改为 `UNION ALL`；若必须去重，优先在外层使用 `GROUP BY uid` 替代 `UNION` 的隐式去重，便于走 Map 端预聚合。改写前请与业务方确认是否依赖去重语义",
+          "expected_gain": "1.3x~2x（取决于 uid 重复率，重复越多收益越大）"
+        }
+      ],
+      "needs_human_check": [
+        "两天分区 uid 重复率是否高：若重复极少，UNION ALL 改写收益更明显；若重复极高，去重代价不可忽略"
+      ],
+      "markdown_report": "## 总结\nSQL 整体写法简洁，分区过滤（dt）使用正确，存储为 ORC，无 JOIN / 窗口 / 排序 / 模糊匹配等问题。唯一触发的写法问题是 `UNION` 隐式去重，建议按业务语义改写。\n\n## 问题列表\n### ISSUE-001 UNION 隐式去重，多一次全局 shuffle\n- **证据**：SQL 使用 `union` 连接两条 `select uid from dwd_user_active where dt='20250101'` 与 `... dt='20250102'`，未使用 `union all`\n- **根因**：`UNION` 等价于 `UNION ALL` + 全局 DISTINCT，会在 Reduce 阶段对两路 uid 做一次全量去重 shuffle；DWD 行为宽表通常每天 uid 集合大量重复，去重代价无谓\n- **建议**：若业务可接受重复，改为 `UNION ALL`；若必须去重，外层 `GROUP BY uid` 替代 `UNION` 的隐式去重以利用 Map 端预聚合。改前务必确认下游是否依赖去重\n- **预估收益**：1.3x~2x（取决于 uid 重复率）\n\n## 需人工核查项\n- 两天分区 uid 实际重复率：若重复极少，UNION ALL 改写收益更明显；若重复本身已经较高，去重 shuffle 的开销占比需要重新评估\n\n## 预估收益\n- 仅改写这一项：保守 1.3x~2x；如确认重复率极低可更高"
+    },
+    "result_markdown": "## 总结\nSQL 整体写法简洁，分区过滤（dt）使用正确，存储为 ORC，无 JOIN / 窗口 / 排序 / 模糊匹配等问题。唯一触发的写法问题是 `UNION` 隐式去重，建议按业务语义改写。\n\n## 问题列表\n### ISSUE-001 UNION 隐式去重，多一次全局 shuffle\n- **证据**：SQL 使用 `union` 连接两条 `select uid from dwd_user_active where dt='20250101'` 与 `... dt='20250102'`，未使用 `union all`\n- **根因**：`UNION` 等价于 `UNION ALL` + 全局 DISTINCT，会在 Reduce 阶段对两路 uid 做一次全量去重 shuffle；DWD 行为宽表通常每天 uid 集合大量重复，去重代价无谓\n- **建议**：若业务可接受重复，改为 `UNION ALL`；若必须去重，外层 `GROUP BY uid` 替代 `UNION` 的隐式去重以利用 Map 端预聚合。改前务必确认下游是否依赖去重\n- **预估收益**：1.3x~2x（取决于 uid 重复率）\n\n## 需人工核查项\n- 两天分区 uid 实际重复率：若重复极少，UNION ALL 改写收益更明显；若重复本身已经较高，去重 shuffle 的开销占比需要重新评估\n\n## 预估收益\n- 仅改写这一项：保守 1.3x~2x；如确认重复率极低可更高",
+    "stages": {
+      "node2_retrieval_query": "UNION 隐式去重 ; UNION ALL deduplicate",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-030] UNION 应改 UNION ALL",
+        "## 知识卡索引",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 根因",
+        "### 根因",
+        "### 建议方向（不给出完整改写 SQL）"
+      ],
+      "node4_elapsed_s": 22.8,
+      "node4_usage": {
+        "completion_tokens": 1092,
+        "prompt_tokens": 3520,
+        "total_tokens": 4612,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"SQL 唯一明显的写法问题是使用 `UNION` 而非 `UNION ALL`，会触发额外的全局去重 shuffle；表本身分区裁剪正常、存储为 ORC、无 JOIN/窗口/排序问题。\",\n  \"severity\": \"low\",\n  \"estimated_speedup\": \"1.3x~2x\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"sql_anti_pattern\",\n      \"severity\": \"low\",\n      \"title\": \"UNION 隐式去重"
+    }
+  },
+  {
+    "model": "minimax-m3",
+    "case_id": 7,
+    "case_label": "CASE-7 clean SQL (fallback)",
+    "score": {
+      "hit_categories": [],
+      "missing": [],
+      "extra": [
+        "sql_anti_pattern"
+      ],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL 写法简洁，命中分区字段 dt，且只取必要列、无 JOIN/聚合/排序/子查询，从 SQL 文本层面未发现明显性能问题。",
+      "severity": "low",
+      "estimated_speedup": "未知，SQL 写法无明显可优化点",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "未发现明显写法问题",
+          "evidence": "SQL 为 `select order_id, amount from dwd_order where dt='20250101';`；表 dwd_order 容量 10.0GB、行数 10000000，DDL 为 `PARTITIONED BY (dt string) STORED AS ORC`。逐项核查：CHK-1 SQL 已用 dt='20250101' 过滤分区；CHK-2 仅显式选取 order_id、amount 两列，无 `*`；CHK-3 无 JOIN；CHK-4 无 count(distinct)；CHK-5 无 order by；CHK-6 无 union；CHK-7 dwd_order 仅被引用 1 次；CHK-8 无窗口函数；CHK-9 无 JOIN/无 cross join；CHK-10 无 LIKE；CHK-11 存储为 ORC 非 TEXTFILE；CHK-12 无 IN/NOT IN 子查询。",
+          "root_cause": "12 项 Checklist 全部不命中，SQL 写法层面没有命中规则的可优化项。",
+          "recommendation": "SQL 已较优（分区剪枝、列裁剪、ORC 列存均已具备）。若任务仍然超过 4 小时，建议从 SQL 之外的方向排查：执行计划（是否有大量 reduce 输入/数据膨胀）、集群资源、ORC 小文件数量、统计信息是否过期、是否存在其他并发任务争抢资源等。",
+          "expected_gain": "未知，SQL 写法无明显可优化空间"
+        }
+      ],
+      "needs_human_check": [
+        "dwd_order 在 dt='20250101' 这一分区的实际文件大小与小文件数量，若小文件过多可能造成 map 任务数膨胀",
+        "dwd_order 是否做过 CBO 统计信息收集（ANALYZE），ORDER_ID 的基数与数据分布建议人工核查",
+        "若该 SQL 实际是被多次/多并发调用，注意是否存在其他上游任务对同一分区产生资源争抢"
+      ],
+      "markdown_report": "## 总结\n\n本任务 SQL 极简：`select order_id, amount from dwd_order where dt='20250101';`。表 dwd_order 容量 10.0GB、1000 万行，DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`。逐项走完 12 项 Checklist 后，**未发现命中项**：分区字段 dt 已用于 WHERE，SELECT 仅为显式两列无 `*`，无 JOIN、无聚合、无排序、无子查询、无窗口、存储为 ORC 列存。SQL 写法层面无可优化点。\n\n## 问题列表\n\n- **ISSUE-001 未发现明显写法问题（severity=low）**\n  - 证据：CHK-1 已用 dt='20250101' 命中分区；CHK-2 显式列、无 `*`；CHK-3 无 JOIN；CHK-4 无 count(distinct)；CHK-5 无 order by；CHK-6 无 union；CHK-7 表仅引用 1 次；CHK-8 无窗口；CHK-9 无 JOIN/cross join；CHK-10 无 LIKE；CHK-11 STORED AS ORC；CHK-12 无 IN 子查询。\n  - 根因：12 项 Checklist 全部不命中，SQL 写法无命中规则的瓶颈。\n  - 建议：保持现状。若运行时长仍 >4h，建议从执行计划、ORC 小文件、CBO 统计、并发争抢等非 SQL 写法方向排查。\n  - 预估收益：未知。\n\n## 需人工核查项\n\n- dwd_order 在 dt='20250101' 分区的实际大小与小文件数量，是否存在 map 任务数膨胀。\n- dwd_order 的 CBO 统计信息是否最新，建议抽样核查 ORDER_ID、AMOUNT 的分布。\n- 该 SQL 是否被多并发/上游链路高频调用，是否存在资源争抢。\n\n## 预估收益\n\nSQL 写法层面无可优化项，整体收益需结合非 SQL 因素评估。"
+    },
+    "result_markdown": "## 总结\n\n本任务 SQL 极简：`select order_id, amount from dwd_order where dt='20250101';`。表 dwd_order 容量 10.0GB、1000 万行，DDL 显示 `PARTITIONED BY (dt string) STORED AS ORC`。逐项走完 12 项 Checklist 后，**未发现命中项**：分区字段 dt 已用于 WHERE，SELECT 仅为显式两列无 `*`，无 JOIN、无聚合、无排序、无子查询、无窗口、存储为 ORC 列存。SQL 写法层面无可优化点。\n\n## 问题列表\n\n- **ISSUE-001 未发现明显写法问题（severity=low）**\n  - 证据：CHK-1 已用 dt='20250101' 命中分区；CHK-2 显式列、无 `*`；CHK-3 无 JOIN；CHK-4 无 count(distinct)；CHK-5 无 order by；CHK-6 无 union；CHK-7 表仅引用 1 次；CHK-8 无窗口；CHK-9 无 JOIN/cross join；CHK-10 无 LIKE；CHK-11 STORED AS ORC；CHK-12 无 IN 子查询。\n  - 根因：12 项 Checklist 全部不命中，SQL 写法无命中规则的瓶颈。\n  - 建议：保持现状。若运行时长仍 >4h，建议从执行计划、ORC 小文件、CBO 统计、并发争抢等非 SQL 写法方向排查。\n  - 预估收益：未知。\n\n## 需人工核查项\n\n- dwd_order 在 dt='20250101' 分区的实际大小与小文件数量，是否存在 map 任务数膨胀。\n- dwd_order 的 CBO 统计信息是否最新，建议抽样核查 ORDER_ID、AMOUNT 的分布。\n- 该 SQL 是否被多并发/上游链路高频调用，是否存在资源争抢。\n\n## 预估收益\n\nSQL 写法层面无可优化项，整体收益需结合非 SQL 因素评估。",
+    "stages": {
+      "node2_retrieval_query": "Hive SQL optimization ; select order_id, amount from dwd_order where dt='20250101';",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "### 问题 SQL",
+        "### 问题 SQL",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 问题 SQL（节选）",
+        "### 问题 SQL（节选）"
+      ],
+      "node4_elapsed_s": 26.0,
+      "node4_usage": {
+        "completion_tokens": 1341,
+        "prompt_tokens": 3449,
+        "total_tokens": 4790,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 0
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"SQL 写法简洁，命中分区字段 dt，且只取必要列、无 JOIN/聚合/排序/子查询，从 SQL 文本层面未发现明显性能问题。\",\"severity\":\"low\",\"estimated_speedup\":\"未知，SQL 写法无明显可优化点\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"low\",\"title\":\"未发现明显写法问题\",\"evidence\":\"SQL 为 `select order_id, amount from dwd_order where dt='2025"
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 1,
+    "case_label": "CASE-1 big-small JOIN + select *",
+    "score": {
+      "hit_categories": [
+        "join_strategy",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 2
+    },
+    "result_json": {
+      "summary": "存在SELECT *列裁剪缺失反模式与大小表JOIN未使用MapJoin的核心写法问题",
+      "severity": "high",
+      "estimated_speedup": "3x~5x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "SELECT * 列裁剪缺失反模式",
+          "evidence": "SQL 第1行使用 `select a.*`，dwd_order表元数据显示其容量为500GB且为分区表，未显式指定所需字段",
+          "root_cause": "未做列裁剪触发大表全列扫描，产生大量不必要的IO开销",
+          "recommendation": "建议仅SELECT业务实际需要的字段（包括JOIN关联键与最终输出列），避免全列扫描",
+          "expected_gain": "1.5x~2x（取决于实际使用字段占比）"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "join_strategy",
+          "severity": "high",
+          "title": "大小表JOIN未使用MapJoin提示",
+          "evidence": "SQL 中使用 `left join dim_user b`，dim_user表元数据显示其容量为50MB（小于100MB阈值），但SQL未添加`/*+ MAPJOIN(b) */`提示",
+          "root_cause": "未触发MapJoin机制，导致500GB的dwd_order表进行全量Shuffle，产生大量网络与磁盘开销",
+          "recommendation": "建议对小表dim_user添加MapJoin提示，将其广播到Map端执行，避免大表Shuffle",
+          "expected_gain": "3x~5x（取决于Shuffle数据量）"
+        }
+      ],
+      "needs_human_check": [
+        "请核查JOIN关联键a.user_id与b.uid的字段值分布，是否存在大量NULL或空字符串",
+        "请确认业务实际需要从dwd_order中获取的具体字段范围"
+      ],
+      "markdown_report": "## 总结\n本次慢SQL存在两处核心写法问题：一是使用SELECT *导致500GB大表全列扫描，二是大小表JOIN未启用MapJoin导致大表全量Shuffle，预估优化后可提速3~5倍。\n\n## 问题列表\n### ISSUE-001：SELECT * 列裁剪缺失反模式\n**证据**：SQL 第1行使用 `select a.*`，dwd_order表元数据显示其容量为500GB且为分区表，未显式指定所需字段。\n**根因**：未做列裁剪触发大表全列扫描，产生大量不必要的IO开销。\n**建议**：仅SELECT业务实际需要的字段（包括JOIN关联键与最终输出列），避免全列扫描。\n**预估收益**：1.5x~2x（取决于实际使用字段占比）\n\n### ISSUE-002：大小表JOIN未使用MapJoin提示\n**证据**：SQL 中使用 `left join dim_user b`，dim_user表元数据显示其容量为50MB（小于100MB阈值），但SQL未添加`/*+ MAPJOIN(b) */`提示。\n**根因**：未触发MapJoin机制，导致500GB的dwd_order表进行全量Shuffle，产生大量网络与磁盘开销。\n**建议**：对小表dim_user添加MapJoin提示，将其广播到Map端执行，避免大表Shuffle。\n**预估收益**：3x~5x（取决于Shuffle数据量）\n\n## 需人工核查项\n1. 请核查JOIN关联键a.user_id与b.uid的字段值分布，是否存在大量NULL或空字符串；\n2. 请确认业务实际需要从dwd_order中获取的具体字段范围。\n\n## 预估收益\n综合优化后预估提速3x~5x。"
+    },
+    "result_markdown": "## 总结\n本次慢SQL存在两处核心写法问题：一是使用SELECT *导致500GB大表全列扫描，二是大小表JOIN未启用MapJoin导致大表全量Shuffle，预估优化后可提速3~5倍。\n\n## 问题列表\n### ISSUE-001：SELECT * 列裁剪缺失反模式\n**证据**：SQL 第1行使用 `select a.*`，dwd_order表元数据显示其容量为500GB且为分区表，未显式指定所需字段。\n**根因**：未做列裁剪触发大表全列扫描，产生大量不必要的IO开销。\n**建议**：仅SELECT业务实际需要的字段（包括JOIN关联键与最终输出列），避免全列扫描。\n**预估收益**：1.5x~2x（取决于实际使用字段占比）\n\n### ISSUE-002：大小表JOIN未使用MapJoin提示\n**证据**：SQL 中使用 `left join dim_user b`，dim_user表元数据显示其容量为50MB（小于100MB阈值），但SQL未添加`/*+ MAPJOIN(b) */`提示。\n**根因**：未触发MapJoin机制，导致500GB的dwd_order表进行全量Shuffle，产生大量网络与磁盘开销。\n**建议**：对小表dim_user添加MapJoin提示，将其广播到Map端执行，避免大表Shuffle。\n**预估收益**：3x~5x（取决于Shuffle数据量）\n\n## 需人工核查项\n1. 请核查JOIN关联键a.user_id与b.uid的字段值分布，是否存在大量NULL或空字符串；\n2. 请确认业务实际需要从dwd_order中获取的具体字段范围。\n\n## 预估收益\n综合优化后预估提速3x~5x。",
+    "stages": {
+      "node2_retrieval_query": "select 星号 ; select star column pruning ; 小表 JOIN MapJoin ; MapJoin broadcast small table",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-020] 大小表 JOIN 未走 MapJoin",
+        "## 知识卡索引",
+        "## [KB-034] 嵌套子查询 / 老式逗号 JOIN",
+        "## [CASE-002] 多表 LEFT JOIN 中间结果膨胀",
+        "### 建议方向",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 49.6,
+      "node4_usage": {
+        "completion_tokens": 3488,
+        "prompt_tokens": 4087,
+        "total_tokens": 7575,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 2540
+        }
+      },
+      "node4_raw_content": "{\n    \"summary\": \"存在SELECT *列裁剪缺失反模式与大小表JOIN未使用MapJoin的核心写法问题\",\n    \"severity\": \"high\",\n    \"estimated_speedup\": \"3x~5x\",\n    \"issues\": [\n        {\n            \"id\": \"ISSUE-001\",\n            \"category\": \"sql_anti_pattern\",\n            \"severity\": \"medium\",\n            \"title\": \"SELECT * 列裁剪缺失反模式\",\n "
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 2,
+    "case_label": "CASE-2 missing partition filter",
+    "score": {
+      "hit_categories": [
+        "partition_pruning"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "dwd_order为500GB的分区表，SQL未使用分区字段dt过滤，触发全表扫描，是核心性能问题",
+      "severity": "high",
+      "estimated_speedup": "5x~10x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "high",
+          "title": "分区裁剪缺失（未使用分区字段过滤）",
+          "evidence": "dwd_order的DDL含`PARTITIONED BY (dt string)`，SQL WHERE子句仅使用普通字段`create_time`（条件：`create_time >= '2024-01-01'`）过滤，未使用分区字段`dt`",
+          "root_cause": "Hive的分区裁剪机制仅识别分区字段的过滤条件，未使用分区字段过滤时会扫描所有分区的全量500GB数据，导致IO与计算开销激增",
+          "recommendation": "建议在WHERE子句中补充分区字段`dt`的过滤条件，将目标`create_time`对应的日期范围映射为`dt`的范围，触发分区裁剪以减少扫描数据量",
+          "expected_gain": "5x~10x（取决于目标分区的总容量占全表的比例）"
+        }
+      ],
+      "needs_human_check": [
+        "请核查dwd_order表中create_time字段与分区字段dt的对应关系，确保补充的dt过滤条件可覆盖目标数据"
+      ],
+      "markdown_report": "## 总结\ndwd_order为500GB的ORC分区表，SQL未使用分区字段dt过滤，导致全表扫描，是核心性能瓶颈。\n\n## 问题列表\n### ISSUE-001 分区裁剪缺失（未使用分区字段过滤）\n- 证据：dwd_order的DDL含`PARTITIONED BY (dt string)`，SQL WHERE子句仅使用普通字段`create_time`（条件：`create_time >= '2024-01-01'`）过滤，未使用分区字段`dt`\n- 根因：Hive的分区裁剪机制仅识别分区字段的过滤条件，未使用分区字段过滤时会扫描所有分区的全量500GB数据，导致IO与计算开销激增\n- 建议：在WHERE子句中补充分区字段`dt`的过滤条件，将目标`create_time`对应的日期范围映射为`dt`的范围，触发分区裁剪以减少扫描数据量\n- 预估收益：5x~10x（取决于目标分区的总容量占全表的比例）\n\n## 需人工核查项\n- 请核查dwd_order表中create_time字段与分区字段dt的对应关系，确保补充的dt过滤条件可覆盖目标数据\n\n## 预估收益\n整体预估可获得5x~10x的性能提升，核心收益来自分区裁剪减少的IO与计算量。"
+    },
+    "result_markdown": "## 总结\ndwd_order为500GB的ORC分区表，SQL未使用分区字段dt过滤，导致全表扫描，是核心性能瓶颈。\n\n## 问题列表\n### ISSUE-001 分区裁剪缺失（未使用分区字段过滤）\n- 证据：dwd_order的DDL含`PARTITIONED BY (dt string)`，SQL WHERE子句仅使用普通字段`create_time`（条件：`create_time >= '2024-01-01'`）过滤，未使用分区字段`dt`\n- 根因：Hive的分区裁剪机制仅识别分区字段的过滤条件，未使用分区字段过滤时会扫描所有分区的全量500GB数据，导致IO与计算开销激增\n- 建议：在WHERE子句中补充分区字段`dt`的过滤条件，将目标`create_time`对应的日期范围映射为`dt`的范围，触发分区裁剪以减少扫描数据量\n- 预估收益：5x~10x（取决于目标分区的总容量占全表的比例）\n\n## 需人工核查项\n- 请核查dwd_order表中create_time字段与分区字段dt的对应关系，确保补充的dt过滤条件可覆盖目标数据\n\n## 预估收益\n整体预估可获得5x~10x的性能提升，核心收益来自分区裁剪减少的IO与计算量。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-011] 分区裁剪缺失",
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-004] 动态分区写入长尾",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [KB-010] 列裁剪缺失（SELECT *）",
+        "## 知识卡索引"
+      ],
+      "node4_elapsed_s": 35.6,
+      "node4_usage": {
+        "completion_tokens": 3164,
+        "prompt_tokens": 3728,
+        "total_tokens": 6892,
+        "prompt_tokens_details": {
+          "cached_tokens": 1848
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 2479
+        }
+      },
+      "node4_raw_content": "{\n    \"summary\": \"dwd_order为500GB的分区表，SQL未使用分区字段dt过滤，触发全表扫描，是核心性能问题\",\n    \"severity\": \"high\",\n    \"estimated_speedup\": \"5x~10x\",\n    \"issues\": [\n        {\n            \"id\": \"ISSUE-001\",\n            \"category\": \"partition_pruning\",\n            \"severity\": \"high\",\n            \"title\": \"分区裁剪缺失（未使用分区字段过"
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 3,
+    "case_label": "CASE-3 multi count(distinct)",
+    "score": {
+      "hit_categories": [
+        "aggregation"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "核心问题为100GB大表dwd_order上使用2个count(distinct)聚合，易触发Hive单Reducer处理的单点瓶颈",
+      "severity": "high",
+      "estimated_speedup": "3x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "aggregation",
+          "severity": "high",
+          "title": "大表存在多个count(distinct)聚合易触发单点瓶颈",
+          "evidence": "SQL中包含2个count(distinct)聚合操作：`count(distinct user_id) as uv`、`count(distinct order_id) as order_cnt`，作用于容量100GB的dwd_order表；dwd_order表DDL为`CREATE TABLE dwd_order (order_id string, user_id string) PARTITIONED BY (dt string) STORED AS ORC`，官方统计size_bytes=100.0GB、row_count=100000000",
+          "root_cause": "Hive中count(distinct)默认会将所有待去重的key集中到单个Reducer处理，当存在多个count(distinct)且表数据量极大时，单点Reducer会成为性能瓶颈，大幅拉长任务时长",
+          "recommendation": "将多个count(distinct)拆解为独立的子查询分别计算后再关联，或采用先通过group by对目标字段去重、再执行count的方式，分散计算压力，避免单点瓶颈",
+          "expected_gain": "3x~5x（取决于实际数据分布）"
+        }
+      ],
+      "needs_human_check": [
+        "请人工核查dwd_order表中user_id、order_id字段的NULL值占比及数据分布，排查是否存在key高度集中的倾斜风险"
+      ],
+      "markdown_report": "## 总结\n本次慢SQL核心问题为大表dwd_order（100GB）上使用2个count(distinct)聚合，易触发Hive单Reducer处理的单点瓶颈，导致任务耗时过长。\n\n## 问题列表\n### ISSUE-001：大表存在多个count(distinct)聚合易触发单点瓶颈\n#### 证据\nSQL中包含2个count(distinct)聚合操作：`count(distinct user_id) as uv`、`count(distinct order_id) as order_cnt`，作用于容量100GB的dwd_order表；dwd_order表DDL为`CREATE TABLE dwd_order (order_id string, user_id string) PARTITIONED BY (dt string) STORED AS ORC`，官方统计size_bytes=100.0GB、row_count=100000000。\n#### 根因\nHive中count(distinct)默认会将所有待去重的key集中到单个Reducer处理，当存在多个count(distinct)且表数据量极大时，单点Reducer会成为性能瓶颈，大幅拉长任务时长。\n#### 建议\n将多个count(distinct)拆解为独立的子查询分别计算后再关联，或采用先通过group by对目标字段去重、再执行count的方式，分散计算压力，避免单点瓶颈。\n#### 预估收益\n3x~5x（取决于实际数据分布）\n\n## 需人工核查项\n1. 请人工核查dwd_order表中user_id、order_id字段的NULL值占比及数据分布，排查是否存在key高度集中的倾斜风险。\n\n## 预估收益\n整体预估提速3x~5x，若存在数据倾斜则收益更高"
+    },
+    "result_markdown": "## 总结\n本次慢SQL核心问题为大表dwd_order（100GB）上使用2个count(distinct)聚合，易触发Hive单Reducer处理的单点瓶颈，导致任务耗时过长。\n\n## 问题列表\n### ISSUE-001：大表存在多个count(distinct)聚合易触发单点瓶颈\n#### 证据\nSQL中包含2个count(distinct)聚合操作：`count(distinct user_id) as uv`、`count(distinct order_id) as order_cnt`，作用于容量100GB的dwd_order表；dwd_order表DDL为`CREATE TABLE dwd_order (order_id string, user_id string) PARTITIONED BY (dt string) STORED AS ORC`，官方统计size_bytes=100.0GB、row_count=100000000。\n#### 根因\nHive中count(distinct)默认会将所有待去重的key集中到单个Reducer处理，当存在多个count(distinct)且表数据量极大时，单点Reducer会成为性能瓶颈，大幅拉长任务时长。\n#### 建议\n将多个count(distinct)拆解为独立的子查询分别计算后再关联，或采用先通过group by对目标字段去重、再执行count的方式，分散计算压力，避免单点瓶颈。\n#### 预估收益\n3x~5x（取决于实际数据分布）\n\n## 需人工核查项\n1. 请人工核查dwd_order表中user_id、order_id字段的NULL值占比及数据分布，排查是否存在key高度集中的倾斜风险。\n\n## 预估收益\n整体预估提速3x~5x，若存在数据倾斜则收益更高",
+    "stages": {
+      "node2_retrieval_query": "count distinct 多字段 ; count distinct skew",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-012] 分区字段被函数包裹",
+        "## [KB-031] COUNT(DISTINCT) 单 Reducer",
+        "## 知识卡索引",
+        "### 问题诊断",
+        "## 真实案例索引",
+        "## [KB-002] DISTINCT 单点瓶颈"
+      ],
+      "node4_elapsed_s": 34.2,
+      "node4_usage": {
+        "completion_tokens": 2322,
+        "prompt_tokens": 4080,
+        "total_tokens": 6402,
+        "prompt_tokens_details": {
+          "cached_tokens": 1848
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 1565
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"核心问题为100GB大表dwd_order上使用2个count(distinct)聚合，易触发Hive单Reducer处理的单点瓶颈\",\"severity\":\"high\",\"estimated_speedup\":\"3x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"aggregation\",\"severity\":\"high\",\"title\":\"大表存在多个count(distinct)聚合易触发单点瓶颈\",\"evidence\":\"SQL中包含2个count(distinct)聚合操作：`count(distinct user_id) "
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 4,
+    "case_label": "CASE-4 ORDER BY no LIMIT + select *",
+    "score": {
+      "hit_categories": [
+        "partition_pruning",
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 3
+    },
+    "result_json": {
+      "summary": "慢SQL存在三大核心写法问题：500GB大分区表未做分区剪枝导致全量扫描、SELECT * 未做列裁剪增加IO开销、大表全局ORDER BY无LIMIT导致单Reducer瓶颈，严重拖慢执行效率",
+      "severity": "critical",
+      "estimated_speedup": "10x+",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "partition_pruning",
+          "severity": "high",
+          "title": "分区表未做分区剪枝，扫描全量数据",
+          "evidence": "dwd_order的DDL含`PARTITIONED BY (dt string)`，SQL的WHERE子句未使用dt分区字段进行过滤",
+          "root_cause": "Hive分区表未指定分区过滤条件时会扫描全部分区，本次涉及500GB全量数据，IO与网络开销极大",
+          "recommendation": "在WHERE子句中添加dt分区的过滤条件，限定扫描的分区范围（如最近N天、指定月份等）",
+          "expected_gain": "5x~10x（取决于过滤后剩余的分区数据量）"
+        },
+        {
+          "id": "ISSUE-002",
+          "category": "sql_anti_pattern",
+          "severity": "medium",
+          "title": "使用SELECT * 未做列裁剪",
+          "evidence": "SQL第1行使用`select *`",
+          "root_cause": "SELECT * 会扫描表中所有列（即使业务仅需要部分列），增加IO、网络与内存开销；虽ORC为列存，但显式指定列可进一步优化",
+          "recommendation": "仅指定业务实际需要的字段（如order_id、create_time），避免使用*",
+          "expected_gain": "2x~3x（取决于实际需要的列数占总列数的比例）"
+        },
+        {
+          "id": "ISSUE-003",
+          "category": "sql_anti_pattern",
+          "severity": "high",
+          "title": "大表全局ORDER BY无LIMIT，单Reducer瓶颈",
+          "evidence": "SQL末尾使用`order by create_time desc`，未添加LIMIT子句",
+          "root_cause": "Hive中ORDER BY会强制使用单个Reducer执行全局排序，500GB大表的全量排序会导致单Reducer资源瓶颈，运行时间极长",
+          "recommendation": "若需要全局排序，添加合理的LIMIT值（如LIMIT 1000）；若仅需要每个Reducer内排序，改用SORT BY替代ORDER BY",
+          "expected_gain": "10x+（解决单Reducer瓶颈，大幅缩短排序时间）"
+        }
+      ],
+      "needs_human_check": [
+        "dwd_order表各dt分区的实际数据量分布，请抽样核查以确定最优的分区过滤范围",
+        "create_time字段的离散度与空值占比，请核查以评估排序操作的实际负载"
+      ],
+      "markdown_report": "## 总结\n本次慢SQL存在三大核心写法问题：500GB大分区表（dwd_order）未做分区剪枝导致全量扫描、SELECT * 未做列裁剪增加IO开销、大表全局ORDER BY无LIMIT导致单Reducer瓶颈，严重影响执行效率。\n\n## 问题列表\n### ISSUE-001 分区表未做分区剪枝\n- 证据：dwd_order的DDL定义为`PARTITIONED BY (dt string)`，SQL语句中未使用dt分区字段进行WHERE过滤\n- 根因：Hive分区表未指定分区过滤条件时会扫描全部分区，本次涉及500GB全量数据，IO与网络开销极大\n- 建议：在WHERE子句中添加dt分区的过滤条件，限定扫描的分区范围（如最近7天、指定月份等）\n- 预估收益：5x~10x（取决于过滤后剩余的分区数据量）\n\n### ISSUE-002 使用SELECT * 未做列裁剪\n- 证据：SQL语句开头使用`select *`\n- 根因：SELECT * 会扫描表中所有列（即使业务仅需要部分列），增加IO、网络与内存开销；虽ORC为列存，但显式指定列可进一步优化\n- 建议：仅指定业务实际需要的字段（如order_id、create_time），避免使用*\n- 预估收益：2x~3x（取决于实际需要的列数占总列数的比例）\n\n### ISSUE-003 大表全局ORDER BY无LIMIT\n- 证据：SQL语句末尾使用`order by create_time desc`，未添加LIMIT子句\n- 根因：Hive中ORDER BY会强制使用单个Reducer执行全局排序，500GB大表的全量排序会导致单Reducer资源瓶颈，运行时间极长\n- 建议：若需要全局排序，添加合理的LIMIT值（如LIMIT 1000）；若仅需要每个Reducer内排序，改用SORT BY替代ORDER BY\n- 预估收益：10x+（解决单Reducer瓶颈，大幅缩短排序时间）\n\n## 需人工核查项\n1. dwd_order表各dt分区的实际数据量分布，确认最优的分区过滤范围\n2. create_time字段的离散度与空值占比，评估排序操作的实际负载\n\n## 预估收益\n综合三个问题的优化，保守预估执行速度提升10x以上，若分区过滤范围足够小，提升可达数十倍。"
+    },
+    "result_markdown": "## 总结\n本次慢SQL存在三大核心写法问题：500GB大分区表（dwd_order）未做分区剪枝导致全量扫描、SELECT * 未做列裁剪增加IO开销、大表全局ORDER BY无LIMIT导致单Reducer瓶颈，严重影响执行效率。\n\n## 问题列表\n### ISSUE-001 分区表未做分区剪枝\n- 证据：dwd_order的DDL定义为`PARTITIONED BY (dt string)`，SQL语句中未使用dt分区字段进行WHERE过滤\n- 根因：Hive分区表未指定分区过滤条件时会扫描全部分区，本次涉及500GB全量数据，IO与网络开销极大\n- 建议：在WHERE子句中添加dt分区的过滤条件，限定扫描的分区范围（如最近7天、指定月份等）\n- 预估收益：5x~10x（取决于过滤后剩余的分区数据量）\n\n### ISSUE-002 使用SELECT * 未做列裁剪\n- 证据：SQL语句开头使用`select *`\n- 根因：SELECT * 会扫描表中所有列（即使业务仅需要部分列），增加IO、网络与内存开销；虽ORC为列存，但显式指定列可进一步优化\n- 建议：仅指定业务实际需要的字段（如order_id、create_time），避免使用*\n- 预估收益：2x~3x（取决于实际需要的列数占总列数的比例）\n\n### ISSUE-003 大表全局ORDER BY无LIMIT\n- 证据：SQL语句末尾使用`order by create_time desc`，未添加LIMIT子句\n- 根因：Hive中ORDER BY会强制使用单个Reducer执行全局排序，500GB大表的全量排序会导致单Reducer资源瓶颈，运行时间极长\n- 建议：若需要全局排序，添加合理的LIMIT值（如LIMIT 1000）；若仅需要每个Reducer内排序，改用SORT BY替代ORDER BY\n- 预估收益：10x+（解决单Reducer瓶颈，大幅缩短排序时间）\n\n## 需人工核查项\n1. dwd_order表各dt分区的实际数据量分布，确认最优的分区过滤范围\n2. create_time字段的离散度与空值占比，评估排序操作的实际负载\n\n## 预估收益\n综合三个问题的优化，保守预估执行速度提升10x以上，若分区过滤范围足够小，提升可达数十倍。",
+    "stages": {
+      "node2_retrieval_query": "分区剪枝 ; partition pruning ; select 星号 ; select star column pruning ; order by 全局排序 无 limit ; order by no limit global sort",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-050] 全局 ORDER BY 无 LIMIT",
+        "## [CASE-001] 大表 ORDER BY 全局排序",
+        "## 知识卡索引",
+        "### 排序语法对比",
+        "### 问题诊断",
+        "## 真实案例索引"
+      ],
+      "node4_elapsed_s": 64.5,
+      "node4_usage": {
+        "completion_tokens": 4998,
+        "prompt_tokens": 4053,
+        "total_tokens": 9051,
+        "prompt_tokens_details": {
+          "cached_tokens": 1848
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 3699
+        }
+      },
+      "node4_raw_content": "{\n  \"summary\": \"慢SQL存在三大核心写法问题：500GB大分区表未做分区剪枝导致全量扫描、SELECT * 未做列裁剪增加IO开销、大表全局ORDER BY无LIMIT导致单Reducer瓶颈，严重拖慢执行效率\",\n  \"severity\": \"critical\",\n  \"estimated_speedup\": \"10x+\",\n  \"issues\": [\n    {\n      \"id\": \"ISSUE-001\",\n      \"category\": \"partition_pruning\",\n      \"severity\": \"high\",\n      \"title\": \"分"
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 5,
+    "case_label": "CASE-5 same table scanned 3 times",
+    "score": {
+      "hit_categories": [
+        "subquery"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "当前SQL存在FCT_ACTIVITY同表3次重复扫描的核心性能问题，产生大量不必要的大表IO",
+      "severity": "high",
+      "estimated_speedup": "2x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "subquery",
+          "severity": "high",
+          "title": "FCT_ACTIVITY同表被多次重复扫描",
+          "evidence": "SQL中存在3个LEFT JOIN子查询，均扫描FCT_ACTIVITY表：1. left join (select process_id from FCT_ACTIVITY where link_define_nm='answer-plan') c on b.process_id=c.process_id；2. left join (select process_id from FCT_ACTIVITY where link_define_nm='intake') d on b.process_id=d.process_id；3. left join (select process_id from FCT_ACTIVITY where link_define_nm='design-doc') e on b.process_id=e.process_id，同表累计被引用3次，且FCT_ACTIVITY容量为50GB",
+          "root_cause": "每个子查询均触发一次FCT_ACTIVITY（50GB大表）的全量扫描，重复扫描的IO与计算成本数倍于单次扫描，Hive引擎不会自动合并相同数据源的子查询扫描逻辑",
+          "recommendation": "建议将3次针对FCT_ACTIVITY的子查询过滤逻辑合并为单次扫描的条件分支（如CASE WHEN或分组聚合），通过一次扫描完成多维度关联匹配，减少大表IO次数",
+          "expected_gain": "2x~3x"
+        }
+      ],
+      "needs_human_check": [
+        "LEFT JOIN关联键process_id在fact_order与FCT_ACTIVITY中的匹配率及空值比例，请抽样核查",
+        "FCT_ACTIVITY中link_define_nm='answer-plan'/'intake'/'design-doc'的记录占比，请核查以评估合并扫描的优化空间"
+      ],
+      "markdown_report": "## 总结\n当前慢SQL的核心性能问题为**FCT_ACTIVITY同表被3次重复扫描**，该操作产生了大量不必要的大表IO，是主要耗时来源。\n\n## 问题列表\n### ISSUE-001：FCT_ACTIVITY同表多次重复扫描\n#### 证据\nSQL中存在3个LEFT JOIN子查询，均扫描FCT_ACTIVITY表：\n1. `left join (select process_id from FCT_ACTIVITY where link_define_nm='answer-plan') c on b.process_id=c.process_id`\n2. `left join (select process_id from FCT_ACTIVITY where link_define_nm='intake') d on b.process_id=d.process_id`\n3. `left join (select process_id from FCT_ACTIVITY where link_define_nm='design-doc') e on b.process_id=e.process_id`\n同表累计被引用3次，且FCT_ACTIVITY容量为50GB。\n#### 根因\n每个子查询均触发一次FCT_ACTIVITY的全量扫描，重复扫描的IO与计算成本数倍于单次扫描，Hive引擎不会自动合并相同数据源的子查询扫描逻辑。\n#### 建议\n将3次针对FCT_ACTIVITY的子查询过滤逻辑，合并为单次扫描的条件分支（如通过CASE WHEN或分组聚合），一次扫描完成多维度的关联匹配，减少大表IO次数。\n#### 预估收益\n2x~3x\n\n## 需人工核查项\n1. LEFT JOIN关联键process_id在fact_order与FCT_ACTIVITY中的匹配率及空值比例，请抽样核查\n2. FCT_ACTIVITY中link_define_nm='answer-plan'/'intake'/'design-doc'的记录占比，请核查以评估合并扫描的优化空间\n\n## 预估收益\n整体性能保守提升2x，最高可达3x"
+    },
+    "result_markdown": "## 总结\n当前慢SQL的核心性能问题为**FCT_ACTIVITY同表被3次重复扫描**，该操作产生了大量不必要的大表IO，是主要耗时来源。\n\n## 问题列表\n### ISSUE-001：FCT_ACTIVITY同表多次重复扫描\n#### 证据\nSQL中存在3个LEFT JOIN子查询，均扫描FCT_ACTIVITY表：\n1. `left join (select process_id from FCT_ACTIVITY where link_define_nm='answer-plan') c on b.process_id=c.process_id`\n2. `left join (select process_id from FCT_ACTIVITY where link_define_nm='intake') d on b.process_id=d.process_id`\n3. `left join (select process_id from FCT_ACTIVITY where link_define_nm='design-doc') e on b.process_id=e.process_id`\n同表累计被引用3次，且FCT_ACTIVITY容量为50GB。\n#### 根因\n每个子查询均触发一次FCT_ACTIVITY的全量扫描，重复扫描的IO与计算成本数倍于单次扫描，Hive引擎不会自动合并相同数据源的子查询扫描逻辑。\n#### 建议\n将3次针对FCT_ACTIVITY的子查询过滤逻辑，合并为单次扫描的条件分支（如通过CASE WHEN或分组聚合），一次扫描完成多维度的关联匹配，减少大表IO次数。\n#### 预估收益\n2x~3x\n\n## 需人工核查项\n1. LEFT JOIN关联键process_id在fact_order与FCT_ACTIVITY中的匹配率及空值比例，请抽样核查\n2. FCT_ACTIVITY中link_define_nm='answer-plan'/'intake'/'design-doc'的记录占比，请核查以评估合并扫描的优化空间\n\n## 预估收益\n整体性能保守提升2x，最高可达3x",
+    "stages": {
+      "node2_retrieval_query": "同表重复扫描 ; repeated table scan grouping sets",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [CASE-004] 同表重复扫描",
+        "## [KB-033] 同表多次扫描应 CASE WHEN 合并",
+        "## [CASE-003] 缺失分区导致全表扫描",
+        "## [CASE-010] OR 逻辑错误导致全表扫描",
+        "## 真实案例索引",
+        "### 根因"
+      ],
+      "node4_elapsed_s": 47.4,
+      "node4_usage": {
+        "completion_tokens": 3352,
+        "prompt_tokens": 3894,
+        "total_tokens": 7246,
+        "prompt_tokens_details": {
+          "cached_tokens": 1848
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 2536
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"当前SQL存在FCT_ACTIVITY同表3次重复扫描的核心性能问题，产生大量不必要的大表IO\",\"severity\":\"high\",\"estimated_speedup\":\"2x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"subquery\",\"severity\":\"high\",\"title\":\"FCT_ACTIVITY同表被多次重复扫描\",\"evidence\":\"SQL中存在3个LEFT JOIN子查询，均扫描FCT_ACTIVITY表：1. left join (select process_id from FCT_ACTIV"
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 6,
+    "case_label": "CASE-6 UNION should be UNION ALL",
+    "score": {
+      "hit_categories": [
+        "sql_anti_pattern"
+      ],
+      "missing": [],
+      "extra": [],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "SQL使用UNION而非UNION ALL，存在多余的全局去重开销",
+      "severity": "low",
+      "estimated_speedup": "1.5x",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "使用UNION隐式去重而非UNION ALL",
+          "evidence": "SQL中存在`select uid from dwd_user_active where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，使用了`union`关键字而非`union all`",
+          "root_cause": "UNION等价于UNION ALL加全局DISTINCT，会额外触发一次Shuffle去重操作，产生不必要的计算与IO开销",
+          "recommendation": "先与业务方确认uid是否允许重复：若允许重复，直接改用UNION ALL；若需去重，可先使用UNION ALL合并分区数据，再在外层添加GROUP BY uid利用Map端预聚合提升效率",
+          "expected_gain": "1.2x~1.5x（取决于实际重复数据量）"
+        }
+      ],
+      "needs_human_check": [
+        "请人工核查dwd_user_active表dt='20250101'与dt='20250102'两个分区中uid的重复率，确认UNION的全局去重是否为业务必需"
+      ],
+      "markdown_report": "## 总结\n本次慢SQL仅存在1处写法问题：使用`UNION`而非`UNION ALL`，存在多余的全局去重开销。\n## 问题列表\n### ISSUE-001：使用UNION隐式去重而非UNION ALL\n- **证据**：SQL中存在`select uid from dwd_user_active where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，使用了`union`关键字而非`union all`\n- **根因**：UNION等价于UNION ALL加全局DISTINCT，会额外触发一次Shuffle去重操作，产生不必要的计算与IO开销\n- **建议**：先与业务方确认uid是否允许重复：若允许重复，直接改用UNION ALL；若需去重，可先使用UNION ALL合并分区数据，再在外层添加GROUP BY uid利用Map端预聚合提升效率\n- **预估收益**：1.2x~1.5x（取决于实际重复数据量）\n## 需人工核查项\n1. 人工核查dwd_user_active表dt='20250101'与dt='20250102'两个分区中uid的重复率，确认UNION的全局去重是否为业务必需\n## 预估收益\n整体预估提速1.2x~1.5x"
+    },
+    "result_markdown": "## 总结\n本次慢SQL仅存在1处写法问题：使用`UNION`而非`UNION ALL`，存在多余的全局去重开销。\n## 问题列表\n### ISSUE-001：使用UNION隐式去重而非UNION ALL\n- **证据**：SQL中存在`select uid from dwd_user_active where dt='20250101' union select uid from dwd_user_active where dt='20250102'`，使用了`union`关键字而非`union all`\n- **根因**：UNION等价于UNION ALL加全局DISTINCT，会额外触发一次Shuffle去重操作，产生不必要的计算与IO开销\n- **建议**：先与业务方确认uid是否允许重复：若允许重复，直接改用UNION ALL；若需去重，可先使用UNION ALL合并分区数据，再在外层添加GROUP BY uid利用Map端预聚合提升效率\n- **预估收益**：1.2x~1.5x（取决于实际重复数据量）\n## 需人工核查项\n1. 人工核查dwd_user_active表dt='20250101'与dt='20250102'两个分区中uid的重复率，确认UNION的全局去重是否为业务必需\n## 预估收益\n整体预估提速1.2x~1.5x",
+    "stages": {
+      "node2_retrieval_query": "UNION 隐式去重 ; UNION ALL deduplicate",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "## [KB-030] UNION 应改 UNION ALL",
+        "## 知识卡索引",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 根因",
+        "### 根因",
+        "### 建议方向（不给出完整改写 SQL）"
+      ],
+      "node4_elapsed_s": 35.9,
+      "node4_usage": {
+        "completion_tokens": 2709,
+        "prompt_tokens": 3933,
+        "total_tokens": 6642,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 2090
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"SQL使用UNION而非UNION ALL，存在多余的全局去重开销\",\"severity\":\"low\",\"estimated_speedup\":\"1.5x\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"low\",\"title\":\"使用UNION隐式去重而非UNION ALL\",\"evidence\":\"SQL中存在`select uid from dwd_user_active where dt='20250101' union select uid from dwd_user"
+    }
+  },
+  {
+    "model": "doubao-seed-2.0-pro",
+    "case_id": 7,
+    "case_label": "CASE-7 clean SQL (fallback)",
+    "score": {
+      "hit_categories": [],
+      "missing": [],
+      "extra": [
+        "sql_anti_pattern"
+      ],
+      "score": 1.0,
+      "issue_count": 1
+    },
+    "result_json": {
+      "summary": "未发现该SQL存在明确的写法层面问题，慢查可能由非写法因素导致，需人工进一步排查",
+      "severity": "low",
+      "estimated_speedup": "1x（无明确写法优化空间）",
+      "issues": [
+        {
+          "id": "ISSUE-001",
+          "category": "sql_anti_pattern",
+          "severity": "low",
+          "title": "未发现明显SQL写法问题",
+          "evidence": "SQL为`select order_id, amount from dwd_order where dt='20250101'`；dwd_order表DDL为`PARTITIONED BY (dt string) STORED AS ORC`，容量10GB；经逐项核查CHK-1至CHK-12，未触发任何SQL写法反模式触发条件",
+          "root_cause": "无符合触发条件的SQL写法层面问题，慢查可能源于非写法因素（如小文件、数据倾斜、算子执行异常等，本规则仅核查写法层面）",
+          "recommendation": "建议人工核查dwd_order表dt='20250101'分区的小文件情况、数据分布，或查看实际执行计划排查耗时异常环节",
+          "expected_gain": "未知，取决于实际排查结果"
+        }
+      ],
+      "needs_human_check": [
+        "核查dwd_order表dt='20250101'分区下的小文件数量是否过多",
+        "查看该SQL的实际执行计划，排查各算子的耗时异常环节",
+        "核查该分区下数据是否存在异常膨胀或倾斜（潜在风险）"
+      ],
+      "markdown_report": "## 总结\n未发现该SQL存在明确的写法层面反模式，慢查可能由非写法因素导致，需人工进一步排查。\n\n## 问题列表\n1. **未发现明显SQL写法问题**\n   - 证据：SQL为`select order_id, amount from dwd_order where dt='20250101'`；dwd_order表DDL为`PARTITIONED BY (dt string) STORED AS ORC`，容量10GB；经逐项核查CHK-1至CHK-12，未触发任何SQL写法反模式触发条件。\n   - 根因：无符合触发条件的SQL写法层面问题，慢查可能源于非写法因素（如小文件、数据倾斜、算子执行异常等，本规则仅核查写法层面）。\n   - 建议：人工核查dwd_order表dt='20250101'分区的小文件情况、数据分布，或查看实际执行计划排查耗时异常环节。\n   - 预估收益：未知，取决于实际排查结果。\n\n## 需人工核查项\n1. 核查dwd_order表dt='20250101'分区下的小文件数量是否过多\n2. 查看该SQL的实际执行计划，排查各算子的耗时异常环节\n3. 核查该分区下数据是否存在异常膨胀或倾斜（潜在风险）\n\n## 预估收益\n无明确SQL写法优化空间，收益取决于非写法因素的排查结果。"
+    },
+    "result_markdown": "## 总结\n未发现该SQL存在明确的写法层面反模式，慢查可能由非写法因素导致，需人工进一步排查。\n\n## 问题列表\n1. **未发现明显SQL写法问题**\n   - 证据：SQL为`select order_id, amount from dwd_order where dt='20250101'`；dwd_order表DDL为`PARTITIONED BY (dt string) STORED AS ORC`，容量10GB；经逐项核查CHK-1至CHK-12，未触发任何SQL写法反模式触发条件。\n   - 根因：无符合触发条件的SQL写法层面问题，慢查可能源于非写法因素（如小文件、数据倾斜、算子执行异常等，本规则仅核查写法层面）。\n   - 建议：人工核查dwd_order表dt='20250101'分区的小文件情况、数据分布，或查看实际执行计划排查耗时异常环节。\n   - 预估收益：未知，取决于实际排查结果。\n\n## 需人工核查项\n1. 核查dwd_order表dt='20250101'分区下的小文件数量是否过多\n2. 查看该SQL的实际执行计划，排查各算子的耗时异常环节\n3. 核查该分区下数据是否存在异常膨胀或倾斜（潜在风险）\n\n## 预估收益\n无明确SQL写法优化空间，收益取决于非写法因素的排查结果。",
+    "stages": {
+      "node2_retrieval_query": "Hive SQL optimization ; select order_id, amount from dwd_order where dt='20250101';",
+      "node3_chunk_count": 6,
+      "node3_chunk_titles": [
+        "### 问题 SQL",
+        "### 问题 SQL",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 建议方向（不给出完整改写 SQL）",
+        "### 问题 SQL（节选）",
+        "### 问题 SQL（节选）"
+      ],
+      "node4_elapsed_s": 40.6,
+      "node4_usage": {
+        "completion_tokens": 2884,
+        "prompt_tokens": 3848,
+        "total_tokens": 6732,
+        "prompt_tokens_details": {
+          "cached_tokens": 1848
+        },
+        "completion_tokens_details": {
+          "reasoning_tokens": 2227
+        }
+      },
+      "node4_raw_content": "{\"summary\":\"未发现该SQL存在明确的写法层面问题，慢查可能由非写法因素导致，需人工进一步排查\",\"severity\":\"low\",\"estimated_speedup\":\"1x（无明确写法优化空间）\",\"issues\":[{\"id\":\"ISSUE-001\",\"category\":\"sql_anti_pattern\",\"severity\":\"low\",\"title\":\"未发现明显SQL写法问题\",\"evidence\":\"SQL为`select order_id, amount from dwd_order where dt='20250101'`；dwd_order表DDL为`PAR"
+    }
+  }
+]

@@ -1,0 +1,43 @@
+{
+  "summary": "存在大表 JOIN 小表未走 MapJoin 与 select * 列裁剪失效两个明确写法问题；并存在 JOIN Key 数据分布的潜在风险需人工核查",
+  "severity": "high",
+  "estimated_speedup": "4x~8x（保守，仅 SQL 写法层面）",
+  "issues": [
+    {
+      "id": "ISSUE-001",
+      "category": "join_strategy",
+      "severity": "high",
+      "title": "大表 JOIN 小表未使用 MapJoin Hint",
+      "evidence": "stats 显示 dwd_order 约 500GB / 50 亿行，dim_user 仅 50MB / 1000 万行；SQL 中 left join dim_user b on a.user_id=b.uid 未使用 /*+ MAPJOIN(b) */",
+      "root_cause": "在大小表悬殊场景，未显式提示 MapJoin 可能导致走 Common Join，需要对 500GB 大表做 shuffle，I/O 与网络成本极高",
+      "recommendation": "在 left join 处对小表 dim_user 添加 MapJoin 提示，使其广播到 Map 端完成关联，避免大表 shuffle。形式示意（不替代完整改写）：`left join /*+ MAPJOIN(b) */ dim_user b ...`",
+      "expected_gain": "3x~5x"
+    },
+    {
+      "id": "ISSUE-002",
+      "category": "sql_anti_pattern",
+      "severity": "medium",
+      "title": "select a.* 导致列存表的列裁剪失效",
+      "evidence": "dwd_order DDL 为 STORED AS ORC，但 SQL 使用 select a.*",
+      "root_cause": "ORC 列存格式的核心优势之一是按需读取列；select * 会读取所有列，I/O 放大且无法享受 ORC 的列裁剪与可能的索引过滤",
+      "recommendation": "仅 select 业务真正需要的列，避免 * 或 a.*；若下游确需全列，应在评审中确认必要性",
+      "expected_gain": "1.5x~2x"
+    },
+    {
+      "id": "ISSUE-003",
+      "category": "partition_pruning",
+      "severity": "low",
+      "title": "分区过滤已存在但仅命中单日，注意上下游一致性",
+      "evidence": "where a.dt='20250101' 命中分区字段 dt，过滤生效",
+      "root_cause": "分区过滤本身已正确使用",
+      "recommendation": "本项无需修改，作为正向确认列出",
+      "expected_gain": "无（已在使用）"
+    }
+  ],
+  "needs_human_check": [
+    "JOIN 关联键 a.user_id 与 b.uid 的数据分布无法从 SQL/DDL/stats 中判断。请抽样核查：a.user_id 是否存在大量 NULL、空字符串或默认值（如 -1、'unknown'），若有则可能触发 JOIN 倾斜，应在业务侧补充打散逻辑。",
+    "请确认 dim_user 是维度全量表且 50MB 容量稳定，避免后续膨胀后 MapJoin 失效。",
+    "请确认下游使用方是否真的需要 dwd_order 的全部列；若否，应进一步收敛 select 列表。"
+  ],
+  "markdown_report": "## 总结\n**主要问题**：大表 JOIN 小表未走 MapJoin + ORC 表 select * 列裁剪失效。仅 SQL 写法层面预估可提速 4x~8x。\n\n## 问题列表\n\n### [HIGH] ISSUE-001 大表 JOIN 小表未使用 MapJoin Hint\n- **证据**：dwd_order ≈ 500GB / 50 亿行，dim_user 仅 50MB / 1000 万行；SQL 未带 `/*+ MAPJOIN(b) */`\n- **根因**：未显式 MapJoin 时可能走 Common Join，需对 500GB 大表 shuffle\n- **建议**：对小表添加 MapJoin 提示，使其在 Map 端完成关联\n- **预估收益**：3x~5x\n\n### [MEDIUM] ISSUE-002 select a.* 列裁剪失效\n- **证据**：dwd_order 为 ORC 表，SQL 使用 `select a.*`\n- **根因**：ORC 列存读取所有列时无法发挥列裁剪优势\n- **建议**：仅 select 业务必需列\n- **预估收益**：1.5x~2x\n\n### [LOW] ISSUE-003 分区过滤已正确使用\n- **证据**：where a.dt='20250101' 命中分区字段\n- **结论**：正向确认，无需修改\n\n## 需人工核查项\n- **JOIN Key 数据分布**：a.user_id / b.uid 是否存在大量 NULL、空串或默认值？无法从 SQL/DDL 看出，请抽样核查；若有需在业务侧补打散逻辑。\n- **dim_user 容量稳定性**：当前 50MB，请确认未来不会快速膨胀，否则 MapJoin 策略需重新评估。\n- **select 列必要性**：与下游确认是否真的需要 dwd_order 全列。\n\n## 预估收益\n仅依据上述 SQL 写法改动，预计 4.5h → 约 35~70 分钟（4x~8x）。若 JOIN Key 确实存在倾斜并配合打散，可进一步提速。"
+}

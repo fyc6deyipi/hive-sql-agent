@@ -1,0 +1,4 @@
+{
+  "sql": "select a.* from dwd_order a left join dim_user b on a.user_id=b.uid where a.dt='20250101';",
+  "tables": "[{\"name\":\"dwd_order\",\"ddl\":\"CREATE TABLE dwd_order (order_id string, user_id string, amount decimal(18,2)) PARTITIONED BY (dt string) STORED AS ORC;\",\"size_bytes\":536870912000,\"row_count\":5000000000},{\"name\":\"dim_user\",\"ddl\":\"CREATE TABLE dim_user (uid string, name string) STORED AS ORC;\",\"size_bytes\":52428800,\"row_count\":10000000}]"
+}

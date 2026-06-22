@@ -1,0 +1,58 @@
+flowchart TD
+    subgraph 用户输入
+        REQ["POST /v1/optimize<br/>{ sql, tables[] }"]
+    end
+
+    subgraph 节点1: 开始（输入参数）
+        N1_INPUT["入参: sql (String), tables (Array&lt;Object&gt;)"]
+    end
+
+    subgraph 节点2: 参数解析（代码节点）
+        N2_CODE["Python: 遍历 tables 数组<br/>1. 将每个 t.ddl 渲染为 SQL 代码块<br/>2. 将 size_bytes 转为人类可读<br/>3. 拼接 SQL 片段+表名为检索 query"]
+        N2_OUT["输出<br/>tables_md (Markdown文本)<br/>retrieval_query (String)<br/>sql (透传)"]
+    end
+
+    subgraph 节点3: 知识库检索
+        N3_KB["知识库: hive_optimization_kb<br/>(合并版kb文件, 按标题切片)"]
+        N3_RET["Query: {{节点2.retrieval_query}}<br/>Top-K: 5<br/>相似度阈值: 0.6"]
+        N3_OUT["输出变量: retrieved_chunks"]
+    end
+
+    subgraph 节点4: LLM 调用（核心）
+        N4_MODEL["模型: qwen-code<br/>温度: 0.1 | max_tokens: 4096<br/>响应: JSON Mode"]
+        N4_SYS["系统提示词<br/>prompts/system_prompt.md"]
+        N4_USER["用户提示词<br/>- SQL: {{节点1.sql}}<br/>- 表信息: {{节点2.tables_md}}<br/>- 知识库: {{节点3.retrieved_chunks}}"]
+        N4_OUT["输出: 结构化 JSON<br/>(summary/issues/needs_human_check/markdown_report)"]
+    end
+
+    subgraph 节点5: JSON 解析（代码节点）
+        N5_CODE["Python: json.loads<br/>兼容 ```json 包裹<br/>失败时返回 raw"]
+        N5_OUT["输出<br/>ok (Bool)<br/>json (Object)<br/>markdown (String)"]
+    end
+
+    subgraph 节点6: 结束（API 响应）
+        N6_RESP["返回<br/>{ ok, json, markdown }"]
+    end
+
+    用户调用 -- POST --> N1_INPUT
+    N1_INPUT --> N2_CODE
+    N2_CODE --> N2_OUT
+    N2_OUT --> N3_RET
+    N3_RET --> N3_KB
+    N3_KB --> N3_OUT
+    N2_OUT -. 用户sql透传 .-> N4_USER
+    N4_USER --> N4_MODEL
+    N3_OUT --> N4_USER
+    N4_SYS --> N4_MODEL
+    N4_MODEL --> N4_OUT
+    N4_OUT --> N5_CODE
+    N5_CODE --> N5_OUT
+    N5_OUT --> N6_RESP
+
+    style REQ fill:#e1f5fe,stroke:#0288d1
+    style N1_INPUT fill:#fff3e0,stroke:#f57c00
+    style N2_CODE fill:#f3e5f5,stroke:#7b1fa2
+    style N3_KB fill:#e8f5e9,stroke:#388e3c
+    style N4_MODEL fill:#fce4ec,stroke:#c62828
+    style N5_CODE fill:#f3e5f5,stroke:#7b1fa2
+    style N6_RESP fill:#e1f5fe,stroke:#0288d1
